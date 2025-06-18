@@ -295,6 +295,8 @@ enum AudioTask {
 pub enum SpeakState {
     Idle,
     Converting,
+    ConvertingFinished,
+    Reset,
     Playing,
 }
 
@@ -416,6 +418,7 @@ impl SpeakStream {
                                     .send(AudioTask::Speech(tempfile, ai_text))
                                     .unwrap();
                             }
+                            let _ = thread_state_tx.send(SpeakState::ConvertingFinished);
                         }
                         None => {
                             println_error("failed to turn text to speech");
@@ -431,6 +434,7 @@ impl SpeakStream {
                             // itself failed. Queue the error audio so it's
                             // played in sequence with other speech.
                             ai_audio_playing_tx.send(AudioTask::Error).unwrap();
+                            let _ = thread_state_tx.send(SpeakState::ConvertingFinished);
                             let _ = thread_state_tx.send(SpeakState::Idle);
                         }
                     }
@@ -492,30 +496,36 @@ impl SpeakStream {
             thread::spawn(move || {
                 let tick_sink = DefaultDeviceSink::new();
                 let tick_path = TICK_TEMP_FILE.path().to_path_buf();
-                let mut should_tick = false;
-                let mut has_spoken = false;
+                let mut pending_conversions: usize = 0;
+                let mut playing = false;
                 loop {
                     match state_rx_tick.recv_timeout(Duration::from_millis(100)) {
                         Ok(SpeakState::Converting) => {
-                            if !has_spoken {
-                                should_tick = true;
+                            pending_conversions = pending_conversions.saturating_add(1);
+                        }
+                        Ok(SpeakState::ConvertingFinished) => {
+                            if pending_conversions > 0 {
+                                pending_conversions -= 1;
                             }
                         }
                         Ok(SpeakState::Playing) => {
-                            has_spoken = true;
-                            should_tick = false;
+                            playing = true;
                             tick_sink.stop();
                         }
                         Ok(SpeakState::Idle) => {
-                            has_spoken = false;
-                            should_tick = false;
+                            playing = false;
+                            tick_sink.stop();
+                        }
+                        Ok(SpeakState::Reset) => {
+                            playing = false;
+                            pending_conversions = 0;
                             tick_sink.stop();
                         }
                         Err(flume::RecvTimeoutError::Disconnected) => break,
                         Err(flume::RecvTimeoutError::Timeout) => {}
                     }
 
-                    if should_tick && tick_sink.empty() {
+                    if !playing && pending_conversions > 0 && tick_sink.empty() {
                         if let Ok(file) = std::fs::File::open(&tick_path) {
                             tick_sink.stop();
                             tick_sink.append(rodio::Decoder::new(BufReader::new(file)).unwrap());
@@ -581,6 +591,7 @@ impl SpeakStream {
         // stop the AI voice from speaking the current sentence
         self.stop_speech_tx.send(()).unwrap();
 
+        let _ = self.state_tx.send(SpeakState::Reset);
         let _ = self.state_tx.send(SpeakState::Idle);
     }
 
