@@ -1,4 +1,3 @@
-
 use anyhow::Context;
 use async_openai::{
     types::{CreateSpeechRequestArgs, SpeechModel, Voice},
@@ -83,60 +82,52 @@ impl SentenceAccumulator {
     /// Adds a token to the sentence accumulator.
     /// Returns a vector of sentences that have been completed.
     fn add_token(&mut self, token: &str) -> Vec<String> {
-        let mut sentences: Vec<String> = Vec::new();
-        for char in token.chars() {
-            self.buffer.push(char);
-
-            if self.buffer.len() > 300 {
-                // Push the sentence to the sentences vector and clear the buffer
-                {
-                    let sentence = self.buffer.trim();
-                    if !sentence.is_empty() {
-                        sentences.push(sentence.to_string());
-                    }
-                    self.buffer.clear();
-                }
-            } else if self.buffer.len() > 200
-                && self
-                    .buffer
-                    .chars()
-                    .last()
-                    .map_or(false, |c| c.is_whitespace())
-            {
-                // Push the sentence to the sentences vector and clear the buffer
-                {
-                    let sentence = self.buffer.trim();
-                    if !sentence.is_empty() {
-                        sentences.push(sentence.to_string());
-                    }
-                    self.buffer.clear();
-                }
-            } else if self.buffer.len() > 15 {
-                if let Some(second_to_last_char) = get_second_to_last_char(&self.buffer) {
-                    if
-                    // If the second to last character is a sentence ending character
-                    self.sentence_end_chars.contains(&second_to_last_char)
-                        // and the last character is whitespace.
-                        && self
-                            .buffer
-                            .chars()
-                            .last()
-                            .map_or(false, |c| c.is_whitespace())
-                    {
-                        // Push the sentence to the sentences vector and clear the buffer
-                        {
-                            let sentence = self.buffer.trim();
-                            if !sentence.is_empty() {
-                                sentences.push(sentence.to_string());
-                            }
-                            self.buffer.clear();
-                        }
-                    }
-                }
+        let mut sentences = Vec::new();
+        for ch in token.chars() {
+            self.buffer.push(ch);
+            if self.should_flush() {
+                self.flush_buffer(&mut sentences);
             }
         }
 
         sentences
+    }
+
+    /// Determine if the current buffer should be flushed as a sentence.
+    fn should_flush(&self) -> bool {
+        let len = self.buffer.len();
+        if len > 300 {
+            true
+        } else if len > 200
+            && self
+                .buffer
+                .chars()
+                .last()
+                .map_or(false, |c| c.is_whitespace())
+        {
+            true
+        } else if len > 15 {
+            if let Some(second) = get_second_to_last_char(&self.buffer) {
+                self.sentence_end_chars.contains(&second)
+                    && self
+                        .buffer
+                        .chars()
+                        .last()
+                        .map_or(false, |c| c.is_whitespace())
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    fn flush_buffer(&mut self, sentences: &mut Vec<String>) {
+        let sentence = self.buffer.trim();
+        if !sentence.is_empty() {
+            sentences.push(sentence.to_string());
+        }
+        self.buffer.clear();
     }
 
     /// Called at the end of the conversation to process the last sentence.
