@@ -13,7 +13,7 @@ use std::io::{BufReader, Write};
 use std::path::Path;
 use std::process::Command;
 use std::sync::LazyLock;
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tempfile::Builder;
@@ -309,12 +309,9 @@ pub struct SpeakStream {
     speech_speed: Arc<Mutex<f32>>,
     voice: Arc<Mutex<Voice>>,
     state_tx: flume::Sender<SpeakState>,
-    audio_ducking_enabled: Arc<std::sync::atomic::AtomicBool>,
     muted: bool,
 }
 impl SpeakStream {
-        let audio_ducking_enabled = Arc::new(AtomicBool::new(ducking));
-
     pub fn new(voice: Voice, speech_speed: f32, tick: bool, ducking: bool) -> Self {
         Self::new_with_ducking(voice, speech_speed, tick, ducking)
     }
@@ -450,9 +447,8 @@ impl SpeakStream {
         // let thread_ai_voice_sink = ai_voice_sink.clone();
         let thread_ai_audio_playing_rx = ai_audio_playing_rx.clone();
         let thread_state_tx2 = state_tx.clone();
-        let thread_duck_flag = audio_ducking_enabled.clone();
         thread::spawn(move || {
-            let audio_ducker = AudioDucker::new(thread_duck_flag);
+            let audio_ducker = AudioDucker::new(ducking);
             let ai_voice_sink = DefaultDeviceSink::new();
             let ai_voice_sink = Arc::new(ai_voice_sink);
 
@@ -555,7 +551,6 @@ impl SpeakStream {
             speech_speed,
             voice,
             state_tx,
-            audio_ducking_enabled,
             muted: false,
         }
     }
@@ -624,14 +619,6 @@ impl SpeakStream {
 
     pub fn get_voice(&self) -> Voice {
         self.voice.lock().map_or(Voice::Echo, |v| v.clone())
-    }
-
-    pub fn set_audio_ducking_enabled(&self, enabled: bool) {
-        self.audio_ducking_enabled.store(enabled, Ordering::SeqCst);
-    }
-
-    pub fn is_audio_ducking_enabled(&self) -> bool {
-        self.audio_ducking_enabled.load(Ordering::SeqCst)
     }
 
     pub fn mute(&mut self) {

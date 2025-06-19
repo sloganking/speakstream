@@ -1,8 +1,6 @@
 #[cfg(target_os = "windows")]
 use std::sync::Mutex;
 
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-
 #[cfg(target_os = "windows")]
 use once_cell::sync::OnceCell;
 
@@ -17,13 +15,13 @@ use windows::{
 };
 
 pub struct AudioDucker {
-    enabled: Arc<AtomicBool>,
+    enabled: bool,
     #[cfg(target_os = "windows")]
     saved: OnceCell<Mutex<Vec<(ISimpleAudioVolume, f32)>>>,
 }
 
 impl AudioDucker {
-    pub fn new(enabled: Arc<AtomicBool>) -> Self {
+    pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
             #[cfg(target_os = "windows")]
@@ -32,29 +30,21 @@ impl AudioDucker {
     }
 
     pub fn duck(&self) {
-        if self.enabled.load(Ordering::SeqCst) {
+        if self.enabled {
             self.duck_impl();
         }
     }
 
     pub fn restore(&self) {
-        if self.enabled.load(Ordering::SeqCst) {
+        if self.enabled {
             self.restore_impl();
         }
     }
 
-    pub fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::SeqCst);
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.enabled.load(Ordering::SeqCst)
-    }
-
     #[cfg(target_os = "windows")]
     fn duck_impl(&self) {
-        use windows::Win32::Media::Audio::{MMDeviceEnumerator, eRender, eMultimedia};
         use windows::core::GUID;
+        use windows::Win32::Media::Audio::{eMultimedia, eRender, MMDeviceEnumerator};
 
         const DUCK_RATIO: f32 = 0.2;
         let storage = self.saved.get_or_init(|| Mutex::new(Vec::new()));
@@ -69,10 +59,11 @@ impl AudioDucker {
                 return;
             }
 
-            let enumerator: IMMDeviceEnumerator = match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
-                Ok(e) => e,
-                Err(_) => return,
-            };
+            let enumerator: IMMDeviceEnumerator =
+                match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
+                    Ok(e) => e,
+                    Err(_) => return,
+                };
             let device = match enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia) {
                 Ok(d) => d,
                 Err(_) => return,
@@ -164,8 +155,7 @@ mod tests {
 
     #[test]
     fn test_duck_no_panic() {
-        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let d = AudioDucker::new(flag);
+        let d = AudioDucker::new(false);
         d.duck();
         d.restore();
     }
