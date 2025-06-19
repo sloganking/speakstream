@@ -616,3 +616,39 @@ impl SpeakStream {
         self.muted
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_shorter() {
+        let s = "hello";
+        assert_eq!(truncate(s, 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_longer() {
+        let s = "hello world";
+        assert_eq!(truncate(s, 5), "hello...");
+    }
+
+    #[test]
+    fn test_get_second_to_last_char() {
+        assert_eq!(get_second_to_last_char("abc"), Some('b'));
+        assert_eq!(get_second_to_last_char("a"), None);
+    }
+
+    #[test]
+    fn test_sentence_accumulator() {
+        let mut acc = SentenceAccumulator::new();
+        let sentences = acc.add_token("Hello there world! ");
+        assert_eq!(sentences, vec!["Hello there world!"]);
+
+        let remaining = acc.complete_sentence();
+        assert!(remaining.is_none());
+
+        acc.add_token("This is the last");
+        assert!(acc.complete_sentence().is_some());
+    }
+}
