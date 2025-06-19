@@ -8,7 +8,6 @@ use once_cell::sync::OnceCell;
 use windows::{
     core::Interface,
     Win32::{
-        Foundation::*,
         Media::Audio::*,
         System::{Com::*, Threading::*},
     },
@@ -43,14 +42,14 @@ impl AudioDucker {
 
     #[cfg(target_os = "windows")]
     fn duck_impl(&self) {
-        use windows::Win32::Media::Audio::{EDataFlow, ERole, MMDeviceEnumerator};
+        use windows::Win32::Media::Audio::{MMDeviceEnumerator, eRender, eMultimedia};
         use windows::core::GUID;
 
         const DUCK_LEVEL: f32 = 0.2;
         let storage = self.saved.get_or_init(|| Mutex::new(Vec::new()));
 
         unsafe {
-            if CoInitializeEx(std::ptr::null_mut(), COINIT_MULTITHREADED).is_err() {
+            if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
                 return;
             }
 
@@ -58,11 +57,11 @@ impl AudioDucker {
                 Ok(e) => e,
                 Err(_) => return,
             };
-            let device = match enumerator.GetDefaultAudioEndpoint(EDataFlow::eRender, ERole::eMultimedia) {
+            let device = match enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia) {
                 Ok(d) => d,
                 Err(_) => return,
             };
-            let manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, std::ptr::null()) {
+            let manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
                 Ok(m) => m,
                 Err(_) => return,
             };
