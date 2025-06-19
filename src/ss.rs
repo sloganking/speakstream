@@ -309,8 +309,6 @@ pub struct SpeakStream {
     speech_speed: Arc<Mutex<f32>>,
     voice: Arc<Mutex<Voice>>,
     state_tx: flume::Sender<SpeakState>,
-    #[allow(dead_code)]
-    audio_ducker: Arc<AudioDucker>,
     muted: bool,
 }
 impl SpeakStream {
@@ -328,8 +326,6 @@ impl SpeakStream {
         let voice = Arc::new(Mutex::new(voice));
         let thread_voice_mutex = voice.clone();
 
-        let audio_ducker = Arc::new(AudioDucker::new(ducking));
-        let thread_audio_ducker = audio_ducker.clone();
         // The sentence accumulator sends sentences to this channel to be turned into speech audio
         let (ai_tts_tx, ai_tts_rx): (flume::Sender<String>, flume::Receiver<String>) =
             flume::unbounded();
@@ -450,9 +446,9 @@ impl SpeakStream {
         // Create the ai voice audio playing thread
         // let thread_ai_voice_sink = ai_voice_sink.clone();
         let thread_ai_audio_playing_rx = ai_audio_playing_rx.clone();
-        let thread_audio_ducker2 = thread_audio_ducker.clone();
         let thread_state_tx2 = state_tx.clone();
         thread::spawn(move || {
+            let audio_ducker = AudioDucker::new(ducking);
             let ai_voice_sink = DefaultDeviceSink::new();
             let ai_voice_sink = Arc::new(ai_voice_sink);
 
@@ -463,14 +459,14 @@ impl SpeakStream {
                         let file = std::fs::File::open(ai_speech_segment.path()).unwrap();
                         ai_voice_sink.stop();
                         ai_voice_sink.append(rodio::Decoder::new(BufReader::new(file)).unwrap());
-                        thread_audio_ducker2.duck();
+                        audio_ducker.duck();
                         info!("Playing AI voice audio: \"{}\"", truncate(&ai_text, 20));
                     }
                     AudioTask::Error => {
                         let _ = thread_state_tx2.send(SpeakState::Playing);
                         let file = std::fs::File::open(FAILED_TEMP_FILE.path()).unwrap();
                         ai_voice_sink.stop();
-                        thread_audio_ducker2.duck();
+                        audio_ducker.duck();
                         ai_voice_sink.append(rodio::Decoder::new(BufReader::new(file)).unwrap());
                         info!("Playing AI voice error audio");
                     }
@@ -483,7 +479,7 @@ impl SpeakStream {
                 // ai_voice_sink.stop();
                 loop {
                     if ai_voice_sink.empty() {
-                        thread_audio_ducker2.restore();
+                        audio_ducker.restore();
                         let _ = thread_state_tx2.send(SpeakState::Idle);
                         break;
                     }
@@ -492,7 +488,7 @@ impl SpeakStream {
                         // empty the stop_speech_rx channel.
                         while stop_speech_rx.try_recv().is_ok() {}
                         ai_voice_sink.stop();
-                        thread_audio_ducker2.restore();
+                        audio_ducker.restore();
                         let _ = thread_state_tx2.send(SpeakState::Idle);
                         break;
                     }
@@ -554,7 +550,6 @@ impl SpeakStream {
             ai_audio_playing_rx,
             speech_speed,
             voice,
-            audio_ducker,
             state_tx,
             muted: false,
         }
