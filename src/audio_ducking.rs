@@ -45,7 +45,7 @@ impl AudioDucker {
         use windows::Win32::Media::Audio::{MMDeviceEnumerator, eRender, eMultimedia};
         use windows::core::GUID;
 
-        const DUCK_LEVEL: f32 = 0.2;
+        const DUCK_RATIO: f32 = 0.2;
         let storage = self.saved.get_or_init(|| Mutex::new(Vec::new()));
 
         unsafe {
@@ -85,7 +85,8 @@ impl AudioDucker {
                     }
                     if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
                         if let Ok(current) = volume.GetMasterVolume() {
-                            let _ = volume.SetMasterVolume(DUCK_LEVEL, std::ptr::null::<GUID>());
+                            let target = current * DUCK_RATIO;
+                            let _ = volume.SetMasterVolume(target, std::ptr::null::<GUID>());
                             save.push((volume, current));
                         }
                     }
