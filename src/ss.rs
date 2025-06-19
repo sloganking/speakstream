@@ -97,29 +97,21 @@ impl SentenceAccumulator {
     fn should_flush(&self) -> bool {
         let len = self.buffer.len();
         if len > 300 {
-            true
-        } else if len > 200
-            && self
-                .buffer
-                .chars()
-                .last()
-                .map_or(false, |c| c.is_whitespace())
-        {
-            true
-        } else if len > 15 {
-            if let Some(second) = get_second_to_last_char(&self.buffer) {
-                self.sentence_end_chars.contains(&second)
-                    && self
-                        .buffer
-                        .chars()
-                        .last()
-                        .map_or(false, |c| c.is_whitespace())
-            } else {
-                false
-            }
-        } else {
-            false
+            return true;
         }
+
+        if len > 200 && self.buffer.chars().last().map_or(false, char::is_whitespace) {
+            return true;
+        }
+
+        if len > 15 {
+            if let Some(second) = get_second_to_last_char(&self.buffer) {
+                return self.sentence_end_chars.contains(&second)
+                    && self.buffer.chars().last().map_or(false, char::is_whitespace);
+            }
+        }
+
+        false
     }
 
     fn flush_buffer(&mut self, sentences: &mut Vec<String>) {
@@ -608,7 +600,7 @@ impl SpeakStream {
     }
 
     pub fn get_voice(&self) -> Voice {
-        self.voice.lock().map(|v| v.clone()).unwrap_or(Voice::Echo)
+        self.voice.lock().map_or(Voice::Echo, |v| v.clone())
     }
 
     pub fn mute(&mut self) {
