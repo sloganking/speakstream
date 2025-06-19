@@ -14,6 +14,7 @@ A streaming text-to-speech library built on OpenAI's API. Feed tokens as they ar
 ## Features
 
 - 🎧 **Sentence-aware streaming** turns tokens into speech as soon as sentences are complete.
+- 🦢 **Optional audio ducking** lowers other application volumes while speech plays and can be toggled at runtime.
 - 🗣️ **Change voices** easily using OpenAI's voice models.
 - ⏩ **Adjust playback speed** on the fly.
 - 🔇 **Mute/unmute** or stop speech instantly.
@@ -47,6 +48,16 @@ async fn main() {
     speak.add_token("Hello, world!");
     speak.complete_sentence();
 }
+```
+
+### Runtime audio ducking
+
+Audio ducking can be enabled when creating a new stream or toggled at runtime:
+
+```rust
+let mut speak = SpeakStream::new_with_ducking(Voice::Alloy, 1.0, true, true);
+assert!(speak.is_audio_ducking_enabled());
+speak.set_audio_ducking_enabled(false);
 ```
 
 ## License
