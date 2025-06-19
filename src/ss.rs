@@ -314,8 +314,8 @@ pub struct SpeakStream {
     muted: bool,
 }
 impl SpeakStream {
-    pub fn new(voice: Voice, speech_speed: f32, tick: bool) -> Self {
-        Self::new_with_ducking(voice, speech_speed, tick, false)
+    pub fn new(voice: Voice, speech_speed: f32, tick: bool, ducking: bool) -> Self {
+        Self::new_with_ducking(voice, speech_speed, tick, ducking)
     }
     pub fn new_with_ducking(voice: Voice, speech_speed: f32, tick: bool, ducking: bool) -> Self {
         // The maximum number of audio files that can be queued up to be played by the AI voice audio
