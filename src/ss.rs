@@ -60,6 +60,11 @@ fn println_error(err: &str) {
     warn!("{}", err);
 }
 
+/// Drains all pending items from a channel receiver.
+fn drain_receiver<T>(rx: &flume::Receiver<T>) {
+    for _ in rx.try_iter() {}
+}
+
 /// SentenceAccumulator is a struct that accumulates tokens into sentences
 /// before sending the sentences to the AI voice channel.
 struct SentenceAccumulator {
@@ -580,13 +585,13 @@ impl SpeakStream {
         self.sentence_accumulator.clear_buffer();
 
         // empty channel of all text messages queued up to be turned into audio speech
-        for _ in self.ai_tts_rx.try_iter() {}
+        drain_receiver(&self.ai_tts_rx);
 
         // empty the futures currently turning text to sound
         self.futures_ordered_kill_tx.send(()).unwrap();
 
         // clear the channel that passes audio files to the ai voice audio playing thread
-        for _ in self.ai_audio_playing_rx.try_iter() {}
+        drain_receiver(&self.ai_audio_playing_rx);
 
         // stop the AI voice from speaking the current sentence
         self.stop_speech_tx.send(()).unwrap();
