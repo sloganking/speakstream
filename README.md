@@ -50,6 +50,16 @@ async fn main() {
 }
 ```
 
+### Runtime audio ducking
+
+Audio ducking can be enabled when creating a new stream or toggled at runtime:
+
+```rust
+let mut speak = SpeakStream::new_with_ducking(Voice::Alloy, 1.0, true, true);
+assert!(speak.is_audio_ducking_enabled());
+speak.set_audio_ducking_enabled(false);
+```
+
 ## License
 
 MIT
