@@ -14,7 +14,7 @@ A streaming text-to-speech library built on OpenAI's API. Feed tokens as they ar
 ## Features
 
 - 🎧 **Sentence-aware streaming** turns tokens into speech as soon as sentences are complete.
-- 🦢 **Optional audio ducking** lowers other application volumes while speech plays.
+- 🦢 **Optional audio ducking** lowers other application volumes while speech plays and can be toggled at runtime.
 - 🗣️ **Change voices** easily using OpenAI's voice models.
 - ⏩ **Adjust playback speed** on the fly.
 - 🔇 **Mute/unmute** or stop speech instantly.

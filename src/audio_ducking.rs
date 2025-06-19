@@ -1,6 +1,8 @@
 #[cfg(target_os = "windows")]
 use std::sync::Mutex;
 
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
 #[cfg(target_os = "windows")]
 use once_cell::sync::OnceCell;
 
@@ -15,13 +17,13 @@ use windows::{
 };
 
 pub struct AudioDucker {
-    enabled: bool,
+    enabled: Arc<AtomicBool>,
     #[cfg(target_os = "windows")]
     saved: OnceCell<Mutex<Vec<(ISimpleAudioVolume, f32)>>>,
 }
 
 impl AudioDucker {
-    pub fn new(enabled: bool) -> Self {
+    pub fn new(enabled: Arc<AtomicBool>) -> Self {
         Self {
             enabled,
             #[cfg(target_os = "windows")]
@@ -30,15 +32,23 @@ impl AudioDucker {
     }
 
     pub fn duck(&self) {
-        if self.enabled {
+        if self.enabled.load(Ordering::SeqCst) {
             self.duck_impl();
         }
     }
 
     pub fn restore(&self) {
-        if self.enabled {
+        if self.enabled.load(Ordering::SeqCst) {
             self.restore_impl();
         }
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst)
     }
 
     #[cfg(target_os = "windows")]
@@ -154,7 +164,8 @@ mod tests {
 
     #[test]
     fn test_duck_no_panic() {
-        let d = AudioDucker::new(false);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = AudioDucker::new(flag);
         d.duck();
         d.restore();
     }
