@@ -43,7 +43,8 @@ use async_openai::types::Voice;
 
 #[tokio::main]
 async fn main() {
-    let mut speak = SpeakStream::new(Voice::Alloy, 1.0, true);
+    // enable streaming audio from OpenAI for lower latency
+    let mut speak = SpeakStream::new(Voice::Alloy, 1.0, true, true);
     speak.add_token("Hello, world!");
     speak.complete_sentence();
 }

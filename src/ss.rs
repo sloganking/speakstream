@@ -3,6 +3,10 @@ use async_openai::{
     types::{CreateSpeechRequestArgs, SpeechModel, Voice},
     Client,
 };
+use futures::StreamExt;
+use reqwest::header;
+use serde_json::{json, to_value};
+use tokio::io::AsyncWriteExt;
 use async_std::future;
 use colored::Colorize;
 
@@ -269,6 +273,109 @@ async fn turn_text_to_speech(
     }
 }
 
+/// Turns text into speech using the AI voice with streaming.
+async fn turn_text_to_speech_stream(
+    ai_text: String,
+    speed: f32,
+    voice: Voice,
+) -> Option<(NamedTempFile, String)> {
+    let api_key = match std::env::var("OPENAI_API_KEY") {
+        Ok(key) => key,
+        Err(_) => {
+            println_error("OPENAI_API_KEY not set");
+            return None;
+        }
+    };
+
+    let client = reqwest::Client::new();
+    let voice_str = format!("{}", to_value(&voice).ok()?);
+
+    let req_body = json!({
+        "input": ai_text,
+        "model": "tts-1",
+        "voice": voice_str.trim_matches('"'),
+        "speed": speed,
+        "response_format": "mp3",
+    });
+
+    let mut response = match client
+        .post("https://api.openai.com/v1/audio/speech")
+        .query(&[("stream", "true")])
+        .header(header::AUTHORIZATION, format!("Bearer {}", api_key))
+        .json(&req_body)
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            println_error(&format!("Failed to send request: {:?}", err));
+            return None;
+        }
+    };
+
+    if !response.status().is_success() {
+        println_error(&format!(
+            "Streaming TTS request failed with status {}",
+            response.status()
+        ));
+        return None;
+    }
+
+    let ai_speech_segment_tempfile = Builder::new()
+        .prefix("ai-speech-segment")
+        .suffix(".mp3")
+        .rand_bytes(16)
+        .tempfile()
+        .unwrap();
+
+    let mut file = match tokio::fs::File::create(ai_speech_segment_tempfile.path()).await {
+        Ok(f) => f,
+        Err(err) => {
+            println_error(&format!("Failed to create temp file: {:?}", err));
+            return None;
+        }
+    };
+
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                if let Err(err) = tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await {
+                    println_error(&format!("Failed to write chunk: {:?}", err));
+                    return None;
+                }
+            }
+            Err(err) => {
+                println_error(&format!("Error reading stream: {:?}", err));
+                return None;
+            }
+        }
+    }
+
+    if let Err(err) = file.flush().await {
+        println_error(&format!("Failed to flush file: {:?}", err));
+    }
+
+    if speed != 1.0 {
+        let sped_up_audio_path = Builder::new()
+            .prefix("quick-assist-ai-voice-sped-up")
+            .suffix(".mp3")
+            .rand_bytes(16)
+            .tempfile()
+            .unwrap();
+
+        adjust_audio_file_speed(
+            ai_speech_segment_tempfile.path(),
+            sped_up_audio_path.path(),
+            speed,
+        );
+
+        Some((sped_up_audio_path, req_body["input"].as_str().unwrap().to_string()))
+    } else {
+        Some((ai_speech_segment_tempfile, req_body["input"].as_str().unwrap().to_string()))
+    }
+}
+
 fn get_second_to_last_char(s: &str) -> Option<char> {
     s.chars().rev().nth(1)
 }
@@ -299,10 +406,11 @@ pub struct SpeakStream {
     voice: Arc<Mutex<Voice>>,
     state_tx: flume::Sender<SpeakState>,
     muted: bool,
+    streaming: bool,
 }
 
 impl SpeakStream {
-    pub fn new(voice: Voice, speech_speed: f32, tick: bool) -> Self {
+    pub fn new(voice: Voice, speech_speed: f32, tick: bool, streaming: bool) -> Self {
         // The maximum number of audio files that can be queued up to be played by the AI voice audio
         // playing thread Limiting this number prevents converting too much text to speech at once and
         // incurring large API costs for conversions that may not be used if speaking is stopped.
@@ -340,6 +448,7 @@ impl SpeakStream {
         let thread_ai_tts_rx = ai_tts_rx.clone();
         let thread_voice_mutex2 = thread_voice_mutex.clone();
         let thread_state_tx = state_tx.clone();
+        let use_streaming = streaming;
         tokio::spawn(async move {
             // Create the futures ordered queue Used to turn text into speech
             // let (mut converting_tx, mut converting_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -355,12 +464,17 @@ impl SpeakStream {
                         let thread_ai_text = ai_text.clone();
                         let thread_speech_speed = thread_speech_speed.clone();
                         let state_tx = thread_state_tx_inner.clone();
+                        let use_stream = use_streaming;
                         converting_tx
                             .send_async(tokio::spawn(async move {
                                 let _ = state_tx.send(SpeakState::Converting);
                                 let speed = *thread_speech_speed.lock().unwrap();
                                 let voice = thread_voice_mutex.lock().unwrap().clone();
-                                turn_text_to_speech(thread_ai_text, speed, voice)
+                                if use_stream {
+                                    turn_text_to_speech_stream(thread_ai_text, speed, voice).await
+                                } else {
+                                    turn_text_to_speech(thread_ai_text, speed, voice).await
+                                }
                             }))
                             .await
                             .unwrap();
@@ -385,9 +499,7 @@ impl SpeakStream {
                 }
 
                 while let Ok(handle) = converting_rx.try_recv() {
-                    let handle = handle.await.unwrap();
-
-                    let tempfile_option = handle.await;
+                    let tempfile_option = handle.await.unwrap();
 
                     match tempfile_option {
                         Some((tempfile, ai_text)) => {
@@ -534,6 +646,7 @@ impl SpeakStream {
             voice,
             state_tx,
             muted: false,
+            streaming,
         }
     }
 
