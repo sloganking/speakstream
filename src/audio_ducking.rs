@@ -8,6 +8,7 @@ use once_cell::sync::OnceCell;
 use windows::{
     core::Interface,
     Win32::{
+        Foundation::S_OK,
         Media::Audio::*,
         System::{Com::*, Threading::*},
     },
@@ -49,7 +50,12 @@ impl AudioDucker {
         let storage = self.saved.get_or_init(|| Mutex::new(Vec::new()));
 
         unsafe {
-            if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
+            // CPAL initializes COM for this thread using `COINIT_APARTMENTTHREADED`.
+            // Using a different model would result in `RPC_E_CHANGED_MODE`, so
+            // we attempt to initialize with the same model and only call
+            // `CoUninitialize` if we actually performed initialization here.
+            let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            if init.is_err() {
                 return;
             }
 
@@ -91,6 +97,9 @@ impl AudioDucker {
                         }
                     }
                 }
+            }
+            if init == S_OK {
+                CoUninitialize();
             }
         }
     }
