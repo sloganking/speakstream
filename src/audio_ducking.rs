@@ -145,7 +145,7 @@ impl AudioDucker {
                         if let Ok(id) = control2.GetSessionIdentifier() {
                             match unsafe { id.to_string() } {
                                 Ok(id_str) => {
-                                    unsafe { CoTaskMemFree(id.0 as _); }
+                                    unsafe { CoTaskMemFree(Some(id.0 as _)); }
                                     if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
                                         if let Ok(current) = volume.GetMasterVolume() {
                                             let target = current * DUCK_RATIO;
@@ -154,7 +154,7 @@ impl AudioDucker {
                                         }
                                     }
                                 }
-                                Err(_) => unsafe { CoTaskMemFree(id.0 as _) },
+                                Err(_) => unsafe { CoTaskMemFree(Some(id.0 as _)) },
                             }
                         }
                     }
@@ -220,14 +220,14 @@ impl AudioDucker {
                         if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
                             if let Ok(id) = control2.GetSessionIdentifier() {
                                 if let Ok(id_str) = unsafe { id.to_string() } {
-                                    unsafe { CoTaskMemFree(id.0 as _); }
+                                    unsafe { CoTaskMemFree(Some(id.0 as _)); }
                                     if let Some(saved_vol) = saved.iter().find(|s| s.id == id_str) {
                                         if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
                                             let _ = volume.SetMasterVolume(saved_vol.volume, std::ptr::null());
                                         }
                                     }
                                 } else {
-                                    unsafe { CoTaskMemFree(id.0 as _); }
+                                    unsafe { CoTaskMemFree(Some(id.0 as _)); }
                                 }
                             }
                         }
