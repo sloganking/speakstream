@@ -1,6 +1,6 @@
 [package]
 name = "speakstream"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "A streaming text-to-speech library using OpenAI's API."
 license = "MIT"
