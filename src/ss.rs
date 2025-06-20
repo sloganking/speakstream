@@ -13,7 +13,7 @@ use std::io::{BufReader, Write};
 use std::path::Path;
 use std::process::Command;
 use std::sync::LazyLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tempfile::Builder;
@@ -309,6 +309,7 @@ pub struct SpeakStream {
     speech_speed: Arc<Mutex<f32>>,
     voice: Arc<Mutex<Voice>>,
     state_tx: flume::Sender<SpeakState>,
+    pending_conversions: Arc<std::sync::atomic::AtomicUsize>,
     muted: bool,
 }
 impl SpeakStream {
@@ -325,6 +326,9 @@ impl SpeakStream {
         let thread_speech_speed = speech_speed.clone();
         let voice = Arc::new(Mutex::new(voice));
         let thread_voice_mutex = voice.clone();
+
+        let pending_conversions = Arc::new(AtomicUsize::new(0));
+        let thread_pending_conversions = pending_conversions.clone();
 
         // The sentence accumulator sends sentences to this channel to be turned into speech audio
         let (ai_tts_tx, ai_tts_rx): (flume::Sender<String>, flume::Receiver<String>) =
@@ -361,6 +365,7 @@ impl SpeakStream {
             {
                 let converting_tx = converting_tx.clone();
                 let thread_state_tx_inner = thread_state_tx.clone();
+                let thread_pending_conversions_inner = thread_pending_conversions.clone();
                 tokio::spawn(async move {
                     // Queue up any text segments to be turned into speech.
                     while let Ok(ai_text) = thread_ai_tts_rx.recv_async().await {
@@ -368,6 +373,7 @@ impl SpeakStream {
                         let thread_ai_text = ai_text.clone();
                         let thread_speech_speed = thread_speech_speed.clone();
                         let state_tx = thread_state_tx_inner.clone();
+                        thread_pending_conversions_inner.fetch_add(1, Ordering::SeqCst);
                         converting_tx
                             .send_async(tokio::spawn(async move {
                                 let _ = state_tx.send(SpeakState::Converting);
@@ -419,6 +425,7 @@ impl SpeakStream {
                                     .send(AudioTask::Speech(tempfile, ai_text))
                                     .unwrap();
                             }
+                            thread_pending_conversions.fetch_sub(1, Ordering::SeqCst);
                             let _ = thread_state_tx.send(SpeakState::ConvertingFinished);
                         }
                         None => {
@@ -435,6 +442,7 @@ impl SpeakStream {
                             // itself failed. Queue the error audio so it's
                             // played in sequence with other speech.
                             ai_audio_playing_tx.send(AudioTask::Error).unwrap();
+                            thread_pending_conversions.fetch_sub(1, Ordering::SeqCst);
                             let _ = thread_state_tx.send(SpeakState::ConvertingFinished);
                             let _ = thread_state_tx.send(SpeakState::Idle);
                         }
@@ -447,6 +455,7 @@ impl SpeakStream {
         // let thread_ai_voice_sink = ai_voice_sink.clone();
         let thread_ai_audio_playing_rx = ai_audio_playing_rx.clone();
         let thread_state_tx2 = state_tx.clone();
+        let thread_pending_conversions_audio = pending_conversions.clone();
         thread::spawn(move || {
             let audio_ducker = AudioDucker::new(ducking);
             let ai_voice_sink = DefaultDeviceSink::new();
@@ -479,7 +488,11 @@ impl SpeakStream {
                 // ai_voice_sink.stop();
                 loop {
                     if ai_voice_sink.empty() {
-                        audio_ducker.restore();
+                        if thread_pending_conversions_audio.load(Ordering::SeqCst) == 0
+                            && thread_ai_audio_playing_rx.is_empty()
+                        {
+                            audio_ducker.restore();
+                        }
                         let _ = thread_state_tx2.send(SpeakState::Idle);
                         break;
                     }
@@ -551,6 +564,7 @@ impl SpeakStream {
             speech_speed,
             voice,
             state_tx,
+            pending_conversions,
             muted: false,
         }
     }
@@ -596,6 +610,8 @@ impl SpeakStream {
 
         // stop the AI voice from speaking the current sentence
         self.stop_speech_tx.send(()).unwrap();
+
+        self.pending_conversions.store(0, Ordering::SeqCst);
 
         let _ = self.state_tx.send(SpeakState::Reset);
         let _ = self.state_tx.send(SpeakState::Idle);
