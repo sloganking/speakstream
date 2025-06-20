@@ -1,5 +1,9 @@
-#[cfg(target_os = "windows")]
-use std::sync::Mutex;
+use ctrlc;
+use std::sync::{Arc, LazyLock, Mutex, Once, Weak};
+
+static ACTIVE_DUCKERS: LazyLock<Mutex<Vec<Weak<AudioDucker>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+static HANDLER_INIT: Once = Once::new();
 
 #[cfg(target_os = "windows")]
 use once_cell::sync::OnceCell;
@@ -15,20 +19,56 @@ use windows::{
     },
 };
 
+#[cfg(target_os = "windows")]
+struct SavedVolume {
+    id: String,
+    volume: f32,
+}
+
 pub struct AudioDucker {
     enabled: bool,
     is_ducked: AtomicBool,
     #[cfg(target_os = "windows")]
-    saved: OnceCell<Mutex<Vec<(ISimpleAudioVolume, f32)>>>,
+    saved: OnceCell<Mutex<Vec<SavedVolume>>>,
 }
 
+
 impl AudioDucker {
-    pub fn new(enabled: bool) -> Self {
-        Self {
+    pub fn new(enabled: bool) -> Arc<Self> {
+        let ducker = Arc::new(Self {
             enabled,
             is_ducked: AtomicBool::new(false),
             #[cfg(target_os = "windows")]
             saved: OnceCell::new(),
+        });
+
+        Self::register_ducker(&ducker);
+        ducker
+    }
+
+    fn register_ducker(ducker: &Arc<Self>) {
+        HANDLER_INIT.call_once(|| {
+            ctrlc::set_handler(|| {
+                Self::restore_all();
+                std::process::exit(0);
+            })
+            .expect("install ctrlc handler");
+
+            std::panic::set_hook(Box::new(|_| {
+                Self::restore_all();
+            }));
+        });
+
+        ACTIVE_DUCKERS.lock().unwrap().push(Arc::downgrade(ducker));
+    }
+
+    fn restore_all() {
+        let mut lock = ACTIVE_DUCKERS.lock().unwrap();
+        lock.retain(|w| w.upgrade().is_some());
+        for weak in lock.iter() {
+            if let Some(d) = weak.upgrade() {
+                d.restore();
+            }
         }
     }
 
@@ -102,12 +142,20 @@ impl AudioDucker {
                                 continue;
                             }
                         }
-                    }
-                    if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
-                        if let Ok(current) = volume.GetMasterVolume() {
-                            let target = current * DUCK_RATIO;
-                            let _ = volume.SetMasterVolume(target, std::ptr::null::<GUID>());
-                            save.push((volume, current));
+                        if let Ok(id) = control2.GetSessionIdentifier() {
+                            match unsafe { id.to_string() } {
+                                Ok(id_str) => {
+                                    unsafe { CoTaskMemFree(Some(id.0 as _)); }
+                                    if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
+                                        if let Ok(current) = volume.GetMasterVolume() {
+                                            let target = current * DUCK_RATIO;
+                                            let _ = volume.SetMasterVolume(target, std::ptr::null::<GUID>());
+                                            save.push(SavedVolume { id: id_str, volume: current });
+                                        }
+                                    }
+                                }
+                                Err(_) => unsafe { CoTaskMemFree(Some(id.0 as _)) },
+                            }
                         }
                     }
                 }
@@ -137,11 +185,60 @@ impl AudioDucker {
     fn restore_impl(&self) {
         if let Some(storage) = self.saved.get() {
             let mut saved = storage.lock().unwrap();
+            if saved.is_empty() {
+                return;
+            }
+
+            use windows::Win32::Media::Audio::{eMultimedia, eRender, MMDeviceEnumerator};
+
             unsafe {
-                for (vol, val) in saved.iter() {
-                    let _ = vol.SetMasterVolume(*val, std::ptr::null());
+                let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                if init.is_err() {
+                    return;
+                }
+
+                let enumerator: IMMDeviceEnumerator = match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
+                    Ok(e) => e,
+                    Err(_) => return,
+                };
+                let device = match enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia) {
+                    Ok(d) => d,
+                    Err(_) => return,
+                };
+                let manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
+                    Ok(m) => m,
+                    Err(_) => return,
+                };
+                let sessions = match manager.GetSessionEnumerator() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let count = sessions.GetCount().unwrap_or(0);
+
+                for i in 0..count {
+                    if let Ok(control) = sessions.GetSession(i) {
+                        if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
+                            if let Ok(id) = control2.GetSessionIdentifier() {
+                                if let Ok(id_str) = unsafe { id.to_string() } {
+                                    unsafe { CoTaskMemFree(Some(id.0 as _)); }
+                                    if let Some(saved_vol) = saved.iter().find(|s| s.id == id_str) {
+                                        if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
+                                            let _ = volume.SetMasterVolume(saved_vol.volume, std::ptr::null());
+                                        }
+                                    }
+                                } else {
+                                    unsafe { CoTaskMemFree(Some(id.0 as _)); }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if init == S_OK {
+                    CoUninitialize();
                 }
             }
+
             saved.clear();
         }
     }
@@ -159,6 +256,12 @@ impl AudioDucker {
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     fn restore_impl(&self) {
         tracing::warn!("Audio ducking restore not supported on this platform");
+    }
+}
+
+impl Drop for AudioDucker {
+    fn drop(&mut self) {
+        self.restore();
     }
 }
 
