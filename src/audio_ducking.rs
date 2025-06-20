@@ -1,5 +1,12 @@
-#[cfg(target_os = "windows")]
-use std::sync::Mutex;
+use signal_hook::{
+    consts::{SIGINT, SIGTERM},
+    iterator::Signals,
+};
+use std::sync::{Arc, LazyLock, Mutex, Once, Weak};
+
+static ACTIVE_DUCKERS: LazyLock<Mutex<Vec<Weak<AudioDucker>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+static HANDLER_INIT: Once = Once::new();
 
 #[cfg(target_os = "windows")]
 use once_cell::sync::OnceCell;
@@ -23,12 +30,40 @@ pub struct AudioDucker {
 }
 
 impl AudioDucker {
-    pub fn new(enabled: bool) -> Self {
-        Self {
+    pub fn new(enabled: bool) -> Arc<Self> {
+        let ducker = Arc::new(Self {
             enabled,
             is_ducked: AtomicBool::new(false),
             #[cfg(target_os = "windows")]
             saved: OnceCell::new(),
+        });
+
+        Self::register_ducker(&ducker);
+        ducker
+    }
+
+    fn register_ducker(ducker: &Arc<Self>) {
+        HANDLER_INIT.call_once(|| {
+            if let Ok(mut signals) = Signals::new([SIGINT, SIGTERM]) {
+                std::thread::spawn(move || {
+                    for _ in signals.forever() {
+                        Self::restore_all();
+                        std::process::exit(0);
+                    }
+                });
+            }
+        });
+
+        ACTIVE_DUCKERS.lock().unwrap().push(Arc::downgrade(ducker));
+    }
+
+    fn restore_all() {
+        let mut lock = ACTIVE_DUCKERS.lock().unwrap();
+        lock.retain(|w| w.upgrade().is_some());
+        for weak in lock.iter() {
+            if let Some(d) = weak.upgrade() {
+                d.restore();
+            }
         }
     }
 
@@ -159,6 +194,12 @@ impl AudioDucker {
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     fn restore_impl(&self) {
         tracing::warn!("Audio ducking restore not supported on this platform");
+    }
+}
+
+impl Drop for AudioDucker {
+    fn drop(&mut self) {
+        self.restore();
     }
 }
 
