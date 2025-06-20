@@ -1,4 +1,4 @@
-use ctrlc;
+use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
 use std::sync::{Arc, LazyLock, Mutex, Once, Weak};
 
 static ACTIVE_DUCKERS: LazyLock<Mutex<Vec<Weak<AudioDucker>>>> =
@@ -48,9 +48,12 @@ impl AudioDucker {
 
     fn register_ducker(ducker: &Arc<Self>) {
         HANDLER_INIT.call_once(|| {
-            let _ = ctrlc::set_handler(|| {
-                Self::restore_all();
-                std::process::exit(0);
+            let mut signals = Signals::new(TERM_SIGNALS).expect("install signal handler");
+            std::thread::spawn(move || {
+                for _ in signals.forever() {
+                    Self::restore_all();
+                    std::process::exit(0);
+                }
             });
 
             std::panic::set_hook(Box::new(|info| {
