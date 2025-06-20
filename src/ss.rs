@@ -13,7 +13,10 @@ use std::io::{BufReader, Write};
 use std::path::Path;
 use std::process::Command;
 use std::sync::LazyLock;
-use std::sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
 use std::time::Duration;
 use tempfile::Builder;
