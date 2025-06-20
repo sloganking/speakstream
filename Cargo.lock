@@ -525,6 +525,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
+name = "default-device-sink"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca2dc7fa1e66bc2bc8e0d35995f57effa7ee2e83f0a13f24451ab9aa49f8da76"
+dependencies = [
+ "cpal",
+ "once_cell",
+ "rodio",
+]
+
+[[package]]
 name = "derive_builder"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1985,6 +1996,7 @@ dependencies = [
  "async-std",
  "colored",
  "cpal",
+ "default-device-sink",
  "flume",
  "futures",
  "once_cell",
