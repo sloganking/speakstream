@@ -7,7 +7,7 @@ use async_std::future;
 use colored::Colorize;
 
 use crate::audio_ducking::AudioDucker;
-use crate::default_device_sink::DefaultDeviceSink;
+use default_device_sink::DefaultDeviceSink;
 use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::Path;
