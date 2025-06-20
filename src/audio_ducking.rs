@@ -3,6 +3,7 @@ use std::sync::Mutex;
 
 #[cfg(target_os = "windows")]
 use once_cell::sync::OnceCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(target_os = "windows")]
 use windows::{
@@ -16,6 +17,7 @@ use windows::{
 
 pub struct AudioDucker {
     enabled: bool,
+    is_ducked: AtomicBool,
     #[cfg(target_os = "windows")]
     saved: OnceCell<Mutex<Vec<(ISimpleAudioVolume, f32)>>>,
 }
@@ -24,6 +26,7 @@ impl AudioDucker {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
+            is_ducked: AtomicBool::new(false),
             #[cfg(target_os = "windows")]
             saved: OnceCell::new(),
         }
@@ -31,14 +34,24 @@ impl AudioDucker {
 
     pub fn duck(&self) {
         if self.enabled {
+            if self.is_ducked.swap(true, Ordering::SeqCst) {
+                return;
+            }
             self.duck_impl();
         }
     }
 
     pub fn restore(&self) {
         if self.enabled {
+            if !self.is_ducked.swap(false, Ordering::SeqCst) {
+                return;
+            }
             self.restore_impl();
         }
+    }
+
+    pub fn is_ducked(&self) -> bool {
+        self.is_ducked.load(Ordering::SeqCst)
     }
 
     #[cfg(target_os = "windows")]
@@ -158,5 +171,17 @@ mod tests {
         let d = AudioDucker::new(false);
         d.duck();
         d.restore();
+    }
+
+    #[test]
+    fn test_duck_state_changes() {
+        let d = AudioDucker::new(true);
+        assert!(!d.is_ducked());
+        d.duck();
+        assert!(d.is_ducked());
+        d.duck();
+        assert!(d.is_ducked());
+        d.restore();
+        assert!(!d.is_ducked());
     }
 }
