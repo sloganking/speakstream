@@ -18,7 +18,7 @@ A streaming text-to-speech library built on OpenAI's API. Feed tokens as they ar
 - 🗣️ **Change voices** easily using OpenAI's voice models.
 - ⏩ **Adjust playback speed** on the fly.
 - 🔇 **Mute/unmute** or stop speech instantly.
-- 🔊 **Automatic output device switching** with `DefaultDeviceSink`.
+- 🔊 **Automatic output device switching** via the `default-device-sink` crate.
 - ✅ **Tick and error sounds** for progress and failures.
 
 ## Setup
