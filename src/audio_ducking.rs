@@ -1,5 +1,9 @@
-#[cfg(target_os = "windows")]
-use std::sync::Mutex;
+use ctrlc;
+use std::sync::{Arc, LazyLock, Mutex, Once, Weak};
+
+static ACTIVE_DUCKERS: LazyLock<Mutex<Vec<Weak<AudioDucker>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+static HANDLER_INIT: Once = Once::new();
 
 #[cfg(target_os = "windows")]
 use once_cell::sync::OnceCell;
@@ -15,20 +19,61 @@ use windows::{
     },
 };
 
+#[cfg(target_os = "windows")]
+struct VolumePair(ISimpleAudioVolume, f32);
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for VolumePair {}
+
+#[cfg(target_os = "windows")]
+unsafe impl Sync for VolumePair {}
+
 pub struct AudioDucker {
     enabled: bool,
     is_ducked: AtomicBool,
     #[cfg(target_os = "windows")]
-    saved: OnceCell<Mutex<Vec<(ISimpleAudioVolume, f32)>>>,
+    saved: OnceCell<Mutex<Vec<VolumePair>>>,
 }
 
+unsafe impl Send for AudioDucker {}
+unsafe impl Sync for AudioDucker {}
+
 impl AudioDucker {
-    pub fn new(enabled: bool) -> Self {
-        Self {
+    pub fn new(enabled: bool) -> Arc<Self> {
+        let ducker = Arc::new(Self {
             enabled,
             is_ducked: AtomicBool::new(false),
             #[cfg(target_os = "windows")]
             saved: OnceCell::new(),
+        });
+
+        Self::register_ducker(&ducker);
+        ducker
+    }
+
+    fn register_ducker(ducker: &Arc<Self>) {
+        HANDLER_INIT.call_once(|| {
+            let _ = ctrlc::set_handler(|| {
+                Self::restore_all();
+                std::process::exit(0);
+            });
+
+            std::panic::set_hook(Box::new(|info| {
+                let _ = info; // ignore info
+                Self::restore_all();
+            }));
+        });
+
+        ACTIVE_DUCKERS.lock().unwrap().push(Arc::downgrade(ducker));
+    }
+
+    fn restore_all() {
+        let mut lock = ACTIVE_DUCKERS.lock().unwrap();
+        lock.retain(|w| w.upgrade().is_some());
+        for weak in lock.iter() {
+            if let Some(d) = weak.upgrade() {
+                d.restore();
+            }
         }
     }
 
@@ -107,7 +152,7 @@ impl AudioDucker {
                         if let Ok(current) = volume.GetMasterVolume() {
                             let target = current * DUCK_RATIO;
                             let _ = volume.SetMasterVolume(target, std::ptr::null::<GUID>());
-                            save.push((volume, current));
+                            save.push(VolumePair(volume, current));
                         }
                     }
                 }
@@ -138,7 +183,7 @@ impl AudioDucker {
         if let Some(storage) = self.saved.get() {
             let mut saved = storage.lock().unwrap();
             unsafe {
-                for (vol, val) in saved.iter() {
+                for VolumePair(vol, val) in saved.iter() {
                     let _ = vol.SetMasterVolume(*val, std::ptr::null());
                 }
             }
@@ -159,6 +204,12 @@ impl AudioDucker {
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     fn restore_impl(&self) {
         tracing::warn!("Audio ducking restore not supported on this platform");
+    }
+}
+
+impl Drop for AudioDucker {
+    fn drop(&mut self) {
+        self.restore();
     }
 }
 
