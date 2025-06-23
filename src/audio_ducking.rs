@@ -29,7 +29,7 @@ unsafe impl Send for VolumePair {}
 unsafe impl Sync for VolumePair {}
 
 pub struct AudioDucker {
-    enabled: bool,
+    enabled: AtomicBool,
     is_ducked: AtomicBool,
     #[cfg(target_os = "windows")]
     saved: OnceCell<Mutex<Vec<VolumePair>>>,
@@ -41,7 +41,7 @@ unsafe impl Sync for AudioDucker {}
 impl AudioDucker {
     pub fn new(enabled: bool) -> Arc<Self> {
         let ducker = Arc::new(Self {
-            enabled,
+            enabled: AtomicBool::new(enabled),
             is_ducked: AtomicBool::new(false),
             #[cfg(target_os = "windows")]
             saved: OnceCell::new(),
@@ -78,7 +78,7 @@ impl AudioDucker {
     }
 
     pub fn duck(&self) {
-        if self.enabled {
+        if self.enabled.load(Ordering::SeqCst) {
             if self.is_ducked.swap(true, Ordering::SeqCst) {
                 return;
             }
@@ -87,7 +87,7 @@ impl AudioDucker {
     }
 
     pub fn restore(&self) {
-        if self.enabled {
+        if self.enabled.load(Ordering::SeqCst) {
             if !self.is_ducked.swap(false, Ordering::SeqCst) {
                 return;
             }
@@ -97,6 +97,17 @@ impl AudioDucker {
 
     pub fn is_ducked(&self) -> bool {
         self.is_ducked.load(Ordering::SeqCst)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::SeqCst);
+        if !enabled {
+            self.restore();
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst)
     }
 
     #[cfg(target_os = "windows")]

@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::LazyLock;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::thread;
@@ -313,13 +313,12 @@ pub struct SpeakStream {
     voice: Arc<Mutex<Voice>>,
     state_tx: flume::Sender<SpeakState>,
     pending_conversions: Arc<std::sync::atomic::AtomicUsize>,
+    audio_ducker: Arc<AudioDucker>,
+    tick_enabled: Arc<AtomicBool>,
     muted: bool,
 }
 impl SpeakStream {
-    pub fn new(voice: Voice, speech_speed: f32, tick: bool) -> Self {
-        Self::new_with_ducking(voice, speech_speed, tick, false)
-    }
-    pub fn new_with_ducking(voice: Voice, speech_speed: f32, tick: bool, ducking: bool) -> Self {
+    pub fn new(voice: Voice, speech_speed: f32, tick: bool, ducking: bool) -> Self {
         // The maximum number of audio files that can be queued up to be played by the AI voice audio
         // playing thread Limiting this number prevents converting too much text to speech at once and
         // incurring large API costs for conversions that may not be used if speaking is stopped.
@@ -329,6 +328,12 @@ impl SpeakStream {
         let thread_speech_speed = speech_speed.clone();
         let voice = Arc::new(Mutex::new(voice));
         let thread_voice_mutex = voice.clone();
+
+        let audio_ducker = AudioDucker::new(ducking);
+        let thread_audio_ducker = audio_ducker.clone();
+
+        let tick_enabled = Arc::new(AtomicBool::new(tick));
+        let thread_tick_enabled = tick_enabled.clone();
 
         let pending_conversions = Arc::new(AtomicUsize::new(0));
         let thread_pending_conversions = pending_conversions.clone();
@@ -460,7 +465,7 @@ impl SpeakStream {
         let thread_state_tx2 = state_tx.clone();
         let thread_pending_conversions_audio = pending_conversions.clone();
         thread::spawn(move || {
-            let audio_ducker = AudioDucker::new(ducking);
+            let audio_ducker = thread_audio_ducker;
             let ai_voice_sink = DefaultDeviceSink::new();
             let ai_voice_sink = Arc::new(ai_voice_sink);
 
@@ -514,48 +519,50 @@ impl SpeakStream {
             }
         });
 
-        if tick {
-            thread::spawn(move || {
-                let tick_sink = DefaultDeviceSink::new();
-                let tick_path = TICK_TEMP_FILE.path().to_path_buf();
-                let mut pending_conversions: usize = 0;
-                let mut playing = false;
-                loop {
-                    match state_rx_tick.recv_timeout(Duration::from_millis(100)) {
-                        Ok(SpeakState::Converting) => {
-                            pending_conversions = pending_conversions.saturating_add(1);
-                        }
-                        Ok(SpeakState::ConvertingFinished) => {
-                            if pending_conversions > 0 {
-                                pending_conversions -= 1;
-                            }
-                        }
-                        Ok(SpeakState::Playing) => {
-                            playing = true;
-                            tick_sink.stop();
-                        }
-                        Ok(SpeakState::Idle) => {
-                            playing = false;
-                            tick_sink.stop();
-                        }
-                        Ok(SpeakState::Reset) => {
-                            playing = false;
-                            pending_conversions = 0;
-                            tick_sink.stop();
-                        }
-                        Err(flume::RecvTimeoutError::Disconnected) => break,
-                        Err(flume::RecvTimeoutError::Timeout) => {}
+        thread::spawn(move || {
+            let tick_sink = DefaultDeviceSink::new();
+            let tick_path = TICK_TEMP_FILE.path().to_path_buf();
+            let mut pending_conversions: usize = 0;
+            let mut playing = false;
+            loop {
+                match state_rx_tick.recv_timeout(Duration::from_millis(100)) {
+                    Ok(SpeakState::Converting) => {
+                        pending_conversions = pending_conversions.saturating_add(1);
                     }
-
-                    if !playing && pending_conversions > 0 && tick_sink.empty() {
-                        if let Ok(file) = std::fs::File::open(&tick_path) {
-                            tick_sink.stop();
-                            tick_sink.append(rodio::Decoder::new(BufReader::new(file)).unwrap());
+                    Ok(SpeakState::ConvertingFinished) => {
+                        if pending_conversions > 0 {
+                            pending_conversions -= 1;
                         }
+                    }
+                    Ok(SpeakState::Playing) => {
+                        playing = true;
+                        tick_sink.stop();
+                    }
+                    Ok(SpeakState::Idle) => {
+                        playing = false;
+                        tick_sink.stop();
+                    }
+                    Ok(SpeakState::Reset) => {
+                        playing = false;
+                        pending_conversions = 0;
+                        tick_sink.stop();
+                    }
+                    Err(flume::RecvTimeoutError::Disconnected) => break,
+                    Err(flume::RecvTimeoutError::Timeout) => {}
+                }
+                if !thread_tick_enabled.load(Ordering::SeqCst) {
+                    tick_sink.stop();
+                    continue;
+                }
+
+                if !playing && pending_conversions > 0 && tick_sink.empty() {
+                    if let Ok(file) = std::fs::File::open(&tick_path) {
+                        tick_sink.stop();
+                        tick_sink.append(rodio::Decoder::new(BufReader::new(file)).unwrap());
                     }
                 }
-            });
-        }
+            }
+        });
 
         SpeakStream {
             sentence_accumulator: SentenceAccumulator::new(),
@@ -568,6 +575,8 @@ impl SpeakStream {
             voice,
             state_tx,
             pending_conversions,
+            audio_ducker,
+            tick_enabled,
             muted: false,
         }
     }
@@ -651,6 +660,22 @@ impl SpeakStream {
 
     pub fn is_muted(&self) -> bool {
         self.muted
+    }
+
+    pub fn set_audio_ducking_enabled(&self, enabled: bool) {
+        self.audio_ducker.set_enabled(enabled);
+    }
+
+    pub fn is_audio_ducking_enabled(&self) -> bool {
+        self.audio_ducker.is_enabled()
+    }
+
+    pub fn set_tick_enabled(&self, enabled: bool) {
+        self.tick_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn is_tick_enabled(&self) -> bool {
+        self.tick_enabled.load(Ordering::SeqCst)
     }
 }
 
