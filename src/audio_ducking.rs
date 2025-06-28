@@ -194,8 +194,14 @@ impl AudioDucker {
         if let Some(storage) = self.saved.get() {
             let mut saved = storage.lock().unwrap();
             unsafe {
-                for VolumePair(vol, val) in saved.iter() {
-                    let _ = vol.SetMasterVolume(*val, std::ptr::null());
+                let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                if init.is_ok() {
+                    for VolumePair(vol, val) in saved.iter() {
+                        let _ = vol.SetMasterVolume(*val, std::ptr::null());
+                    }
+                    if init == S_OK {
+                        CoUninitialize();
+                    }
                 }
             }
             saved.clear();
