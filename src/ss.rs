@@ -623,6 +623,11 @@ impl SpeakStream {
         // stop the AI voice from speaking the current sentence
         self.stop_speech_tx.send(()).unwrap();
 
+        // Ensure audio levels are immediately restored even if the audio
+        // playing thread is waiting on new tasks and doesn't handle the stop
+        // signal right away.
+        self.audio_ducker.restore();
+
         self.pending_conversions.store(0, Ordering::SeqCst);
 
         let _ = self.state_tx.send(SpeakState::Reset);
