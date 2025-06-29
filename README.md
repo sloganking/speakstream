@@ -58,6 +58,10 @@ Audio ducking can be enabled when creating a new stream or toggled at runtime:
 let mut speak = SpeakStream::new(Voice::Ash, 1.0, true, true);
 assert!(speak.is_audio_ducking_enabled());
 speak.set_audio_ducking_enabled(false);
+// manually start ducking when the user begins talking
+speak.start_audio_ducking();
+// ...record microphone input...
+speak.stop_audio_ducking();
 ```
 
 ## License
