@@ -675,6 +675,21 @@ impl SpeakStream {
         self.audio_ducker.is_enabled()
     }
 
+    /// Manually start audio ducking regardless of whether the stream is
+    /// currently speaking. This can be useful to integrate with push-to-talk
+    /// systems so that other application volumes are lowered when the user
+    /// begins talking.
+    pub fn start_audio_ducking(&self) {
+        self.audio_ducker.duck();
+    }
+
+    /// Manually restore audio levels after a call to `start_audio_ducking`.
+    /// If speech is currently playing, levels will be restored automatically
+    /// when it finishes, so this is primarily for external integrations.
+    pub fn stop_audio_ducking(&self) {
+        self.audio_ducker.restore();
+    }
+
     pub fn set_tick_enabled(&self, enabled: bool) {
         self.tick_enabled.store(enabled, Ordering::SeqCst);
     }
@@ -717,5 +732,12 @@ mod tests {
 
         acc.add_token("This is the last");
         assert!(acc.complete_sentence().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_manual_ducking_no_panic() {
+        let speak = SpeakStream::new(Voice::Echo, 1.0, false, false);
+        speak.start_audio_ducking();
+        speak.stop_audio_ducking();
     }
 }
