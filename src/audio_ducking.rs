@@ -6,8 +6,16 @@ static ACTIVE_DUCKERS: LazyLock<Mutex<Vec<Weak<AudioDucker>>>> =
 static HANDLER_INIT: Once = Once::new();
 
 #[cfg(target_os = "windows")]
+use default_device_sink::DefaultDeviceSink;
+#[cfg(target_os = "windows")]
 use once_cell::sync::OnceCell;
+#[cfg(target_os = "windows")]
+use rodio::Decoder;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "windows")]
+use std::{fs::File, io::BufReader, io::Write, thread, time::Duration};
+#[cfg(target_os = "windows")]
+use tempfile::{Builder, NamedTempFile};
 
 #[cfg(target_os = "windows")]
 use windows::{
@@ -20,13 +28,45 @@ use windows::{
 };
 
 #[cfg(target_os = "windows")]
-struct VolumePair(ISimpleAudioVolume, f32);
+#[derive(Clone)]
+struct VolumePair {
+    id: String,
+    volume: f32,
+}
 
 #[cfg(target_os = "windows")]
-unsafe impl Send for VolumePair {}
+fn create_temp_file_from_bytes(bytes: &[u8], extension: &str) -> NamedTempFile {
+    let temp_file = Builder::new()
+        .prefix("temp-file")
+        .suffix(extension)
+        .rand_bytes(16)
+        .tempfile()
+        .unwrap();
+
+    let mut file = File::create(temp_file.path()).unwrap();
+    file.write_all(bytes).unwrap();
+
+    temp_file
+}
 
 #[cfg(target_os = "windows")]
-unsafe impl Sync for VolumePair {}
+static FAILED_TEMP_FILE: LazyLock<NamedTempFile> =
+    LazyLock::new(|| create_temp_file_from_bytes(include_bytes!("../assets/failed.mp3"), ".mp3"));
+
+#[cfg(target_os = "windows")]
+fn play_error_sound_twice() {
+    thread::spawn(|| {
+        let sink = DefaultDeviceSink::new();
+        for _ in 0..2 {
+            if let Ok(file) = File::open(FAILED_TEMP_FILE.path()) {
+                sink.append(Decoder::new(BufReader::new(file)).unwrap());
+                while !sink.empty() {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    });
+}
 
 pub struct AudioDucker {
     enabled: AtomicBool,
@@ -158,12 +198,23 @@ impl AudioDucker {
                                 continue;
                             }
                         }
-                    }
-                    if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
-                        if let Ok(current) = volume.GetMasterVolume() {
-                            let target = current * DUCK_RATIO;
-                            let _ = volume.SetMasterVolume(target, std::ptr::null::<GUID>());
-                            save.push(VolumePair(volume, current));
+                        if let Ok(id_pwstr) = control2.GetSessionInstanceIdentifier() {
+                            if let Ok(id_string) = id_pwstr.to_string() {
+                                CoTaskMemFree(Some(id_pwstr.0 as _));
+                                if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
+                                    if let Ok(current) = volume.GetMasterVolume() {
+                                        let target = current * DUCK_RATIO;
+                                        let _ = volume
+                                            .SetMasterVolume(target, std::ptr::null::<GUID>());
+                                        save.push(VolumePair {
+                                            id: id_string,
+                                            volume: current,
+                                        });
+                                    }
+                                }
+                            } else {
+                                CoTaskMemFree(Some(id_pwstr.0 as _));
+                            }
                         }
                     }
                 }
@@ -193,18 +244,65 @@ impl AudioDucker {
     fn restore_impl(&self) {
         if let Some(storage) = self.saved.get() {
             let mut saved = storage.lock().unwrap();
+            if saved.is_empty() {
+                return;
+            }
+            let mut failed = false;
             unsafe {
                 let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-                if init.is_ok() {
-                    for VolumePair(vol, val) in saved.iter() {
-                        let _ = vol.SetMasterVolume(*val, std::ptr::null());
+                if init.is_err() {
+                    return;
+                }
+
+                let enumerator: IMMDeviceEnumerator =
+                    match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
+                        Ok(e) => e,
+                        Err(_) => return,
+                    };
+                let device = match enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia) {
+                    Ok(d) => d,
+                    Err(_) => return,
+                };
+                let manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
+                    Ok(m) => m,
+                    Err(_) => return,
+                };
+                let sessions = match manager.GetSessionEnumerator() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let count = sessions.GetCount().unwrap_or(0);
+                for i in 0..count {
+                    if let Ok(control) = sessions.GetSession(i) {
+                        if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
+                            if let Ok(id_pwstr) = control2.GetSessionInstanceIdentifier() {
+                                if let Ok(id_string) = id_pwstr.to_string() {
+                                    CoTaskMemFree(Some(id_pwstr.0 as _));
+                                    if let Some(pair) = saved.iter().find(|p| p.id == id_string) {
+                                        if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
+                                            if volume
+                                                .SetMasterVolume(pair.volume, std::ptr::null())
+                                                .is_err()
+                                            {
+                                                failed = true;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    CoTaskMemFree(Some(id_pwstr.0 as _));
+                                }
+                            }
+                        }
                     }
-                    if init == S_OK {
-                        CoUninitialize();
-                    }
+                }
+                if init == S_OK {
+                    CoUninitialize();
                 }
             }
             saved.clear();
+            if failed {
+                play_error_sound_twice();
+            }
         }
     }
 
