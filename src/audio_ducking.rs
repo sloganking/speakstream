@@ -78,6 +78,21 @@ pub struct AudioDucker {
 unsafe impl Send for AudioDucker {}
 unsafe impl Sync for AudioDucker {}
 
+// Removes the given indices from the vector in descending order to avoid
+// invalidating subsequent indices. This is a pure helper used by restore logic
+// to keep only entries that were not yet restored.
+fn remove_indices_descending<T>(vec: &mut Vec<T>, mut indices: Vec<usize>) {
+    if indices.is_empty() {
+        return;
+    }
+    indices.sort_unstable_by(|a, b| b.cmp(a));
+    for idx in indices {
+        if idx < vec.len() {
+            vec.remove(idx);
+        }
+    }
+}
+
 impl AudioDucker {
     pub fn new(enabled: bool) -> Arc<Self> {
         let ducker = Arc::new(Self {
@@ -158,6 +173,16 @@ impl AudioDucker {
         const DUCK_RATIO: f32 = 0.2;
         let storage = self.saved.get_or_init(|| Mutex::new(Vec::new()));
 
+        // Attempt to restore any previously un-restored sessions before we
+        // begin a new ducking cycle. This prevents carrying over stale
+        // ducked volumes from a prior run.
+        if let Some(existing) = self.saved.get() {
+            if !existing.lock().unwrap().is_empty() {
+                // Best-effort; ignore any failures here.
+                self.restore_impl();
+            }
+        }
+
         unsafe {
             // CPAL initializes COM for this thread using `COINIT_APARTMENTTHREADED`.
             // Using a different model would result in `RPC_E_CHANGED_MODE`, so
@@ -198,7 +223,8 @@ impl AudioDucker {
                                 continue;
                             }
                         }
-                        if let Ok(id_pwstr) = control2.GetSessionInstanceIdentifier() {
+                        // Use stable session identifier, not the volatile instance identifier.
+                        if let Ok(id_pwstr) = control2.GetSessionIdentifier() {
                             if let Ok(id_string) = id_pwstr.to_string() {
                                 CoTaskMemFree(Some(id_pwstr.0 as _));
                                 if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
@@ -248,6 +274,9 @@ impl AudioDucker {
                 return;
             }
             let mut failed = false;
+            // Track which saved entries we successfully restored so that we
+            // can remove only those, keeping the rest for future attempts.
+            let mut restored_indices: Vec<usize> = Vec::new();
             unsafe {
                 let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
                 if init.is_err() {
@@ -275,16 +304,21 @@ impl AudioDucker {
                 for i in 0..count {
                     if let Ok(control) = sessions.GetSession(i) {
                         if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
-                            if let Ok(id_pwstr) = control2.GetSessionInstanceIdentifier() {
+                            // Match using the stable session identifier.
+                            if let Ok(id_pwstr) = control2.GetSessionIdentifier() {
                                 if let Ok(id_string) = id_pwstr.to_string() {
                                     CoTaskMemFree(Some(id_pwstr.0 as _));
-                                    if let Some(pair) = saved.iter().find(|p| p.id == id_string) {
+                                    if let Some((idx, pair)) =
+                                        saved.iter().enumerate().find(|(_, p)| p.id == id_string)
+                                    {
                                         if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
                                             if volume
                                                 .SetMasterVolume(pair.volume, std::ptr::null())
                                                 .is_err()
                                             {
                                                 failed = true;
+                                            } else {
+                                                restored_indices.push(idx);
                                             }
                                         }
                                     }
@@ -299,7 +333,11 @@ impl AudioDucker {
                     CoUninitialize();
                 }
             }
-            saved.clear();
+            // Remove only successfully restored entries; keep the rest so they
+            // can be retried on subsequent restore attempts.
+            if !saved.is_empty() {
+                remove_indices_descending(&mut saved, restored_indices);
+            }
             if failed {
                 play_error_sound_twice();
             }
@@ -349,5 +387,21 @@ mod tests {
         assert!(d.is_ducked());
         d.restore();
         assert!(!d.is_ducked());
+    }
+
+    #[test]
+    fn test_remove_indices_descending() {
+        let mut v = vec![0, 1, 2, 3, 4, 5];
+        remove_indices_descending(&mut v, vec![1, 4]);
+        assert_eq!(v, vec![0, 2, 3, 5]);
+
+        let mut v2 = vec![10, 20, 30];
+        remove_indices_descending(&mut v2, vec![]);
+        assert_eq!(v2, vec![10, 20, 30]);
+
+        let mut v3 = vec![7, 8, 9];
+        // Including an out-of-bounds index should be ignored safely
+        remove_indices_descending(&mut v3, vec![0, 10, 2]);
+        assert_eq!(v3, vec![8]);
     }
 }
