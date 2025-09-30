@@ -11,7 +11,7 @@ use default_device_sink::DefaultDeviceSink;
 use once_cell::sync::OnceCell;
 #[cfg(target_os = "windows")]
 use rodio::Decoder;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(target_os = "windows")]
 use std::{fs::File, io::BufReader, io::Write, thread, time::Duration};
 #[cfg(target_os = "windows")]
@@ -70,7 +70,8 @@ fn play_error_sound_twice() {
 
 pub struct AudioDucker {
     enabled: AtomicBool,
-    is_ducked: AtomicBool,
+    // Reference-count of active ducking requests (AI playback, PTT, etc)
+    duck_count: AtomicUsize,
     #[cfg(target_os = "windows")]
     saved: OnceCell<Mutex<Vec<VolumePair>>>,
 }
@@ -97,7 +98,7 @@ impl AudioDucker {
     pub fn new(enabled: bool) -> Arc<Self> {
         let ducker = Arc::new(Self {
             enabled: AtomicBool::new(enabled),
-            is_ducked: AtomicBool::new(false),
+            duck_count: AtomicUsize::new(0),
             #[cfg(target_os = "windows")]
             saved: OnceCell::new(),
         });
@@ -127,37 +128,44 @@ impl AudioDucker {
         lock.retain(|w| w.upgrade().is_some());
         for weak in lock.iter() {
             if let Some(d) = weak.upgrade() {
-                d.restore();
+                d.restore_force();
             }
         }
     }
 
     pub fn duck(&self) {
-        if self.enabled.load(Ordering::SeqCst) {
-            if self.is_ducked.swap(true, Ordering::SeqCst) {
-                return;
-            }
+        if !self.enabled.load(Ordering::SeqCst) {
+            return;
+        }
+        let previous = self.duck_count.fetch_add(1, Ordering::SeqCst);
+        if previous == 0 {
             self.duck_impl();
         }
     }
 
     pub fn restore(&self) {
-        if self.enabled.load(Ordering::SeqCst) {
-            if !self.is_ducked.swap(false, Ordering::SeqCst) {
-                return;
-            }
+        if !self.enabled.load(Ordering::SeqCst) {
+            return;
+        }
+        let prev = self.duck_count.load(Ordering::SeqCst);
+        if prev == 0 {
+            return;
+        }
+        let old = self.duck_count.fetch_sub(1, Ordering::SeqCst);
+        if old == 1 {
+            // Transitioned from 1 -> 0
             self.restore_impl();
         }
     }
 
     pub fn is_ducked(&self) -> bool {
-        self.is_ducked.load(Ordering::SeqCst)
+        self.duck_count.load(Ordering::SeqCst) > 0
     }
 
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::SeqCst);
         if !enabled {
-            self.restore();
+            self.restore_force();
         }
     }
 
@@ -362,7 +370,17 @@ impl AudioDucker {
 
 impl Drop for AudioDucker {
     fn drop(&mut self) {
-        self.restore();
+        self.restore_force();
+    }
+}
+
+impl AudioDucker {
+    // Forcefully clear all duck requests and restore volumes immediately
+    fn restore_force(&self) {
+        let was_ducked = self.duck_count.swap(0, Ordering::SeqCst) > 0;
+        if was_ducked && self.enabled.load(Ordering::SeqCst) {
+            self.restore_impl();
+        }
     }
 }
 
@@ -381,11 +399,13 @@ mod tests {
     fn test_duck_state_changes() {
         let d = AudioDucker::new(true);
         assert!(!d.is_ducked());
-        d.duck();
+        d.duck(); // count 1
         assert!(d.is_ducked());
-        d.duck();
+        d.duck(); // count 2
         assert!(d.is_ducked());
-        d.restore();
+        d.restore(); // count 1
+        assert!(d.is_ducked());
+        d.restore(); // count 0
         assert!(!d.is_ducked());
     }
 
@@ -403,5 +423,23 @@ mod tests {
         // Including an out-of-bounds index should be ignored safely
         remove_indices_descending(&mut v3, vec![0, 10, 2]);
         assert_eq!(v3, vec![8]);
+    }
+
+    #[test]
+    fn test_duck_ref_counting() {
+        let d = AudioDucker::new(true);
+        assert!(!d.is_ducked());
+
+        d.duck(); // count 1
+        assert!(d.is_ducked());
+
+        d.duck(); // count 2
+        assert!(d.is_ducked());
+
+        d.restore(); // count 1
+        assert!(d.is_ducked());
+
+        d.restore(); // count 0
+        assert!(!d.is_ducked());
     }
 }
