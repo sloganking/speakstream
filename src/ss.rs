@@ -468,6 +468,7 @@ impl SpeakStream {
             let audio_ducker = thread_audio_ducker;
             let ai_voice_sink = DefaultDeviceSink::new();
             let ai_voice_sink = Arc::new(ai_voice_sink);
+            let mut is_ducked = false;
 
             for task in thread_ai_audio_playing_rx.iter() {
                 match task {
@@ -476,40 +477,48 @@ impl SpeakStream {
                         let file = std::fs::File::open(ai_speech_segment.path()).unwrap();
                         ai_voice_sink.stop();
                         ai_voice_sink.append(rodio::Decoder::new(BufReader::new(file)).unwrap());
-                        audio_ducker.duck();
+                        if !is_ducked {
+                            audio_ducker.duck();
+                            is_ducked = true;
+                        }
                         info!("Playing AI voice audio: \"{}\"", truncate(&ai_text, 20));
                     }
                     AudioTask::Error => {
                         let _ = thread_state_tx2.send(SpeakState::Playing);
                         let file = std::fs::File::open(FAILED_TEMP_FILE.path()).unwrap();
                         ai_voice_sink.stop();
-                        audio_ducker.duck();
+                        if !is_ducked {
+                            audio_ducker.duck();
+                            is_ducked = true;
+                        }
                         ai_voice_sink.append(rodio::Decoder::new(BufReader::new(file)).unwrap());
                         info!("Playing AI voice error audio");
                     }
                 }
 
-                // sink.play();
-
                 while stop_speech_rx.try_recv().is_ok() {}
 
-                // ai_voice_sink.stop();
                 loop {
                     if ai_voice_sink.empty() {
                         if thread_pending_conversions_audio.load(Ordering::SeqCst) == 0
                             && thread_ai_audio_playing_rx.is_empty()
                         {
-                            audio_ducker.restore();
+                            if is_ducked {
+                                audio_ducker.restore();
+                                is_ducked = false;
+                            }
                         }
                         let _ = thread_state_tx2.send(SpeakState::Idle);
                         break;
                     }
 
                     if stop_speech_rx.try_recv().is_ok() {
-                        // empty the stop_speech_rx channel.
                         while stop_speech_rx.try_recv().is_ok() {}
                         ai_voice_sink.stop();
-                        audio_ducker.restore();
+                        if is_ducked {
+                            audio_ducker.restore();
+                            is_ducked = false;
+                        }
                         let _ = thread_state_tx2.send(SpeakState::Idle);
                         break;
                     }
@@ -623,10 +632,10 @@ impl SpeakStream {
         // stop the AI voice from speaking the current sentence
         self.stop_speech_tx.send(()).unwrap();
 
-        // Ensure audio levels are immediately restored even if the audio
-        // playing thread is waiting on new tasks and doesn't handle the stop
-        // signal right away.
-        self.audio_ducker.restore();
+        // Forcefully restore audio levels even if duck_count > 1 from
+        // prior playback races. restore_force resets the count to 0 so
+        // restore_impl always runs.
+        self.audio_ducker.restore_force();
 
         self.pending_conversions.store(0, Ordering::SeqCst);
 

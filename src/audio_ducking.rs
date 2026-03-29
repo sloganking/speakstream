@@ -375,8 +375,8 @@ impl Drop for AudioDucker {
 }
 
 impl AudioDucker {
-    // Forcefully clear all duck requests and restore volumes immediately
-    fn restore_force(&self) {
+    /// Forcefully clear all duck requests and restore volumes immediately.
+    pub fn restore_force(&self) {
         let was_ducked = self.duck_count.swap(0, Ordering::SeqCst) > 0;
         if was_ducked && self.enabled.load(Ordering::SeqCst) {
             self.restore_impl();
