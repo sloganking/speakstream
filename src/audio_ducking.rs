@@ -11,7 +11,7 @@ use default_device_sink::DefaultDeviceSink;
 use once_cell::sync::OnceCell;
 #[cfg(target_os = "windows")]
 use rodio::Decoder;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "windows")]
 use std::{fs::File, io::BufReader, io::Write, thread, time::Duration};
 #[cfg(target_os = "windows")]
@@ -70,8 +70,12 @@ fn play_error_sound_twice() {
 
 pub struct AudioDucker {
     enabled: AtomicBool,
-    // Reference-count of active ducking requests (AI playback, PTT, etc)
-    duck_count: AtomicUsize,
+    /// 0.0-1.0 fraction of original volume that other apps play at while ducked.
+    /// e.g. 0.2 = very quiet, 0.5 = half volume, 1.0 = no change.
+    duck_ratio: Mutex<f32>,
+    /// True when volumes are currently ducked. Uses compare_exchange for
+    /// race-free transitions -- no TOCTOU window.
+    ducked: AtomicBool,
     #[cfg(target_os = "windows")]
     saved: OnceCell<Mutex<Vec<VolumePair>>>,
 }
@@ -79,9 +83,6 @@ pub struct AudioDucker {
 unsafe impl Send for AudioDucker {}
 unsafe impl Sync for AudioDucker {}
 
-// Removes the given indices from the vector in descending order to avoid
-// invalidating subsequent indices. This is a pure helper used by restore logic
-// to keep only entries that were not yet restored.
 fn remove_indices_descending<T>(vec: &mut Vec<T>, mut indices: Vec<usize>) {
     if indices.is_empty() {
         return;
@@ -95,10 +96,21 @@ fn remove_indices_descending<T>(vec: &mut Vec<T>, mut indices: Vec<usize>) {
 }
 
 impl AudioDucker {
-    pub fn new(enabled: bool) -> Arc<Self> {
+    /// Create a new AudioDucker.
+    ///
+    /// `duck_level`: `None` disables ducking entirely. `Some(ratio)` enables
+    /// ducking where `ratio` (0.0 - 1.0) is the fraction of original volume
+    /// other apps play at while ducked. For example `Some(0.5)` = half volume,
+    /// `Some(0.2)` = very quiet.
+    pub fn new(duck_level: Option<f32>) -> Arc<Self> {
+        let (enabled, ratio) = match duck_level {
+            Some(r) => (true, r.clamp(0.0, 1.0)),
+            None => (false, 1.0),
+        };
         let ducker = Arc::new(Self {
             enabled: AtomicBool::new(enabled),
-            duck_count: AtomicUsize::new(0),
+            duck_ratio: Mutex::new(ratio),
+            ducked: AtomicBool::new(false),
             #[cfg(target_os = "windows")]
             saved: OnceCell::new(),
         });
@@ -115,7 +127,7 @@ impl AudioDucker {
             });
 
             std::panic::set_hook(Box::new(|info| {
-                let _ = info; // ignore info
+                let _ = info;
                 Self::restore_all();
             }));
         });
@@ -133,33 +145,40 @@ impl AudioDucker {
         }
     }
 
+    /// Duck other applications' audio. Idempotent: calling while already
+    /// ducked is a no-op. Uses compare_exchange so concurrent calls from
+    /// different threads are safe.
     pub fn duck(&self) {
         if !self.enabled.load(Ordering::SeqCst) {
             return;
         }
-        let previous = self.duck_count.fetch_add(1, Ordering::SeqCst);
-        if previous == 0 {
+        if self
+            .ducked
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
             self.duck_impl();
         }
     }
 
+    /// Restore other applications' audio. Idempotent: calling while not
+    /// ducked is a no-op. Uses compare_exchange so concurrent calls from
+    /// different threads are safe.
     pub fn restore(&self) {
         if !self.enabled.load(Ordering::SeqCst) {
             return;
         }
-        let prev = self.duck_count.load(Ordering::SeqCst);
-        if prev == 0 {
-            return;
-        }
-        let old = self.duck_count.fetch_sub(1, Ordering::SeqCst);
-        if old == 1 {
-            // Transitioned from 1 -> 0
+        if self
+            .ducked
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
             self.restore_impl();
         }
     }
 
     pub fn is_ducked(&self) -> bool {
-        self.duck_count.load(Ordering::SeqCst) > 0
+        self.ducked.load(Ordering::SeqCst)
     }
 
     pub fn set_enabled(&self, enabled: bool) {
@@ -173,29 +192,29 @@ impl AudioDucker {
         self.enabled.load(Ordering::SeqCst)
     }
 
+    pub fn set_duck_ratio(&self, ratio: f32) {
+        *self.duck_ratio.lock().unwrap() = ratio.clamp(0.0, 1.0);
+    }
+
+    pub fn get_duck_ratio(&self) -> f32 {
+        *self.duck_ratio.lock().unwrap()
+    }
+
     #[cfg(target_os = "windows")]
     fn duck_impl(&self) {
         use windows::core::GUID;
         use windows::Win32::Media::Audio::{eMultimedia, eRender, MMDeviceEnumerator};
 
-        const DUCK_RATIO: f32 = 0.2;
+        let duck_ratio = *self.duck_ratio.lock().unwrap();
         let storage = self.saved.get_or_init(|| Mutex::new(Vec::new()));
 
-        // Attempt to restore any previously un-restored sessions before we
-        // begin a new ducking cycle. This prevents carrying over stale
-        // ducked volumes from a prior run.
         if let Some(existing) = self.saved.get() {
             if !existing.lock().unwrap().is_empty() {
-                // Best-effort; ignore any failures here.
                 self.restore_impl();
             }
         }
 
         unsafe {
-            // CPAL initializes COM for this thread using `COINIT_APARTMENTTHREADED`.
-            // Using a different model would result in `RPC_E_CHANGED_MODE`, so
-            // we attempt to initialize with the same model and only call
-            // `CoUninitialize` if we actually performed initialization here.
             let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             if init.is_err() {
                 return;
@@ -231,13 +250,12 @@ impl AudioDucker {
                                 continue;
                             }
                         }
-                        // Use stable session identifier, not the volatile instance identifier.
                         if let Ok(id_pwstr) = control2.GetSessionIdentifier() {
                             if let Ok(id_string) = id_pwstr.to_string() {
                                 CoTaskMemFree(Some(id_pwstr.0 as _));
                                 if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
                                     if let Ok(current) = volume.GetMasterVolume() {
-                                        let target = current * DUCK_RATIO;
+                                        let target = current * duck_ratio;
                                         let _ = volume
                                             .SetMasterVolume(target, std::ptr::null::<GUID>());
                                         save.push(VolumePair {
@@ -282,8 +300,6 @@ impl AudioDucker {
                 return;
             }
             let mut failed = false;
-            // Track which saved entries we successfully restored so that we
-            // can remove only those, keeping the rest for future attempts.
             let mut restored_indices: Vec<usize> = Vec::new();
             unsafe {
                 let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -312,7 +328,6 @@ impl AudioDucker {
                 for i in 0..count {
                     if let Ok(control) = sessions.GetSession(i) {
                         if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
-                            // Match using the stable session identifier.
                             if let Ok(id_pwstr) = control2.GetSessionIdentifier() {
                                 if let Ok(id_string) = id_pwstr.to_string() {
                                     CoTaskMemFree(Some(id_pwstr.0 as _));
@@ -341,8 +356,6 @@ impl AudioDucker {
                     CoUninitialize();
                 }
             }
-            // Remove only successfully restored entries; keep the rest so they
-            // can be retried on subsequent restore attempts.
             if !saved.is_empty() {
                 remove_indices_descending(&mut saved, restored_indices);
             }
@@ -375,9 +388,10 @@ impl Drop for AudioDucker {
 }
 
 impl AudioDucker {
-    /// Forcefully clear all duck requests and restore volumes immediately.
+    /// Forcefully restore volumes immediately regardless of current state.
+    /// Uses swap so it's race-free with concurrent duck/restore calls.
     pub fn restore_force(&self) {
-        let was_ducked = self.duck_count.swap(0, Ordering::SeqCst) > 0;
+        let was_ducked = self.ducked.swap(false, Ordering::SeqCst);
         if was_ducked && self.enabled.load(Ordering::SeqCst) {
             self.restore_impl();
         }
@@ -390,22 +404,22 @@ mod tests {
 
     #[test]
     fn test_duck_no_panic() {
-        let d = AudioDucker::new(false);
+        let d = AudioDucker::new(None);
         d.duck();
         d.restore();
     }
 
     #[test]
     fn test_duck_state_changes() {
-        let d = AudioDucker::new(true);
+        let d = AudioDucker::new(Some(0.5));
         assert!(!d.is_ducked());
-        d.duck(); // count 1
+        d.duck();
         assert!(d.is_ducked());
-        d.duck(); // count 2
+        d.duck(); // idempotent
         assert!(d.is_ducked());
-        d.restore(); // count 1
-        assert!(d.is_ducked());
-        d.restore(); // count 0
+        d.restore();
+        assert!(!d.is_ducked());
+        d.restore(); // idempotent
         assert!(!d.is_ducked());
     }
 
@@ -420,26 +434,30 @@ mod tests {
         assert_eq!(v2, vec![10, 20, 30]);
 
         let mut v3 = vec![7, 8, 9];
-        // Including an out-of-bounds index should be ignored safely
         remove_indices_descending(&mut v3, vec![0, 10, 2]);
         assert_eq!(v3, vec![8]);
     }
 
     #[test]
-    fn test_duck_ref_counting() {
-        let d = AudioDucker::new(true);
+    fn test_duck_idempotent() {
+        let d = AudioDucker::new(Some(0.5));
         assert!(!d.is_ducked());
-
-        d.duck(); // count 1
+        d.duck();
         assert!(d.is_ducked());
-
-        d.duck(); // count 2
+        d.duck(); // second duck is no-op
         assert!(d.is_ducked());
+        d.restore(); // single restore fully unducks
+        assert!(!d.is_ducked());
+    }
 
-        d.restore(); // count 1
+    #[test]
+    fn test_restore_force() {
+        let d = AudioDucker::new(Some(0.5));
+        d.duck();
         assert!(d.is_ducked());
-
-        d.restore(); // count 0
+        d.restore_force();
+        assert!(!d.is_ducked());
+        d.restore_force(); // safe to call when not ducked
         assert!(!d.is_ducked());
     }
 }

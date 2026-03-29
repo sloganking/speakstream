@@ -318,7 +318,13 @@ pub struct SpeakStream {
     muted: bool,
 }
 impl SpeakStream {
-    pub fn new(voice: Voice, speech_speed: f32, tick: bool, ducking: bool) -> Self {
+    /// Create a new SpeakStream.
+    ///
+    /// `duck_level`: `None` disables audio ducking. `Some(ratio)` enables it
+    /// where `ratio` (0.0 - 1.0) is the fraction of original volume other
+    /// apps play at while speech is active. For example `Some(0.5)` = other
+    /// apps at half volume, `Some(0.2)` = very quiet.
+    pub fn new(voice: Voice, speech_speed: f32, tick: bool, duck_level: Option<f32>) -> Self {
         // The maximum number of audio files that can be queued up to be played by the AI voice audio
         // playing thread Limiting this number prevents converting too much text to speech at once and
         // incurring large API costs for conversions that may not be used if speaking is stopped.
@@ -329,7 +335,7 @@ impl SpeakStream {
         let voice = Arc::new(Mutex::new(voice));
         let thread_voice_mutex = voice.clone();
 
-        let audio_ducker = AudioDucker::new(ducking);
+        let audio_ducker = AudioDucker::new(duck_level);
         let thread_audio_ducker = audio_ducker.clone();
 
         let tick_enabled = Arc::new(AtomicBool::new(tick));
@@ -468,7 +474,6 @@ impl SpeakStream {
             let audio_ducker = thread_audio_ducker;
             let ai_voice_sink = DefaultDeviceSink::new();
             let ai_voice_sink = Arc::new(ai_voice_sink);
-            let mut is_ducked = false;
 
             for task in thread_ai_audio_playing_rx.iter() {
                 match task {
@@ -477,20 +482,14 @@ impl SpeakStream {
                         let file = std::fs::File::open(ai_speech_segment.path()).unwrap();
                         ai_voice_sink.stop();
                         ai_voice_sink.append(rodio::Decoder::new(BufReader::new(file)).unwrap());
-                        if !is_ducked {
-                            audio_ducker.duck();
-                            is_ducked = true;
-                        }
+                        audio_ducker.duck();
                         info!("Playing AI voice audio: \"{}\"", truncate(&ai_text, 20));
                     }
                     AudioTask::Error => {
                         let _ = thread_state_tx2.send(SpeakState::Playing);
                         let file = std::fs::File::open(FAILED_TEMP_FILE.path()).unwrap();
                         ai_voice_sink.stop();
-                        if !is_ducked {
-                            audio_ducker.duck();
-                            is_ducked = true;
-                        }
+                        audio_ducker.duck();
                         ai_voice_sink.append(rodio::Decoder::new(BufReader::new(file)).unwrap());
                         info!("Playing AI voice error audio");
                     }
@@ -503,10 +502,7 @@ impl SpeakStream {
                         if thread_pending_conversions_audio.load(Ordering::SeqCst) == 0
                             && thread_ai_audio_playing_rx.is_empty()
                         {
-                            if is_ducked {
-                                audio_ducker.restore();
-                                is_ducked = false;
-                            }
+                            audio_ducker.restore();
                         }
                         let _ = thread_state_tx2.send(SpeakState::Idle);
                         break;
@@ -515,10 +511,9 @@ impl SpeakStream {
                     if stop_speech_rx.try_recv().is_ok() {
                         while stop_speech_rx.try_recv().is_ok() {}
                         ai_voice_sink.stop();
-                        if is_ducked {
-                            audio_ducker.restore();
-                            is_ducked = false;
-                        }
+                        // Don't restore here -- stop_speech() already called
+                        // restore_force() from the caller's thread, and
+                        // compare_exchange ensures no double-restore.
                         let _ = thread_state_tx2.send(SpeakState::Idle);
                         break;
                     }
@@ -684,6 +679,16 @@ impl SpeakStream {
         self.audio_ducker.is_enabled()
     }
 
+    /// Set how much other apps are quieted while speaking.
+    /// `ratio` is 0.0 - 1.0 (fraction of original volume).
+    pub fn set_duck_ratio(&self, ratio: f32) {
+        self.audio_ducker.set_duck_ratio(ratio);
+    }
+
+    pub fn get_duck_ratio(&self) -> f32 {
+        self.audio_ducker.get_duck_ratio()
+    }
+
     /// Manually start audio ducking regardless of whether the stream is
     /// currently speaking. This can be useful to integrate with push-to-talk
     /// systems so that other application volumes are lowered when the user
@@ -745,7 +750,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_manual_ducking_no_panic() {
-        let speak = SpeakStream::new(Voice::Echo, 1.0, false, false);
+        let speak = SpeakStream::new(Voice::Echo, 1.0, false, None);
         speak.start_audio_ducking();
         speak.stop_audio_ducking();
     }
