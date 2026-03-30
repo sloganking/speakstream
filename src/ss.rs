@@ -439,7 +439,11 @@ impl SpeakStream {
                                     .send(AudioTask::Speech(tempfile, ai_text))
                                     .unwrap();
                             }
-                            thread_pending_conversions.fetch_sub(1, Ordering::SeqCst);
+                            let _ = thread_pending_conversions.fetch_update(
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                                |v| Some(v.saturating_sub(1)),
+                            );
                             let _ = thread_state_tx.send(SpeakState::ConvertingFinished);
                         }
                         None => {
@@ -450,13 +454,12 @@ impl SpeakStream {
                                 }
                             }
 
-                            // Any outstanding conversions are aborted above
-                            // when a push-to-talk kill signal is received,
-                            // so reaching this branch means the conversion
-                            // itself failed. Queue the error audio so it's
-                            // played in sequence with other speech.
                             ai_audio_playing_tx.send(AudioTask::Error).unwrap();
-                            thread_pending_conversions.fetch_sub(1, Ordering::SeqCst);
+                            let _ = thread_pending_conversions.fetch_update(
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                                |v| Some(v.saturating_sub(1)),
+                            );
                             let _ = thread_state_tx.send(SpeakState::ConvertingFinished);
                             let _ = thread_state_tx.send(SpeakState::Idle);
                         }
@@ -523,21 +526,13 @@ impl SpeakStream {
             }
         });
 
+        let thread_pending_conversions_tick = pending_conversions.clone();
         thread::spawn(move || {
             let tick_sink = DefaultDeviceSink::new();
             let tick_path = TICK_TEMP_FILE.path().to_path_buf();
-            let mut pending_conversions: usize = 0;
             let mut playing = false;
             loop {
                 match state_rx_tick.recv_timeout(Duration::from_millis(100)) {
-                    Ok(SpeakState::Converting) => {
-                        pending_conversions = pending_conversions.saturating_add(1);
-                    }
-                    Ok(SpeakState::ConvertingFinished) => {
-                        if pending_conversions > 0 {
-                            pending_conversions -= 1;
-                        }
-                    }
                     Ok(SpeakState::Playing) => {
                         playing = true;
                         tick_sink.stop();
@@ -548,9 +543,9 @@ impl SpeakStream {
                     }
                     Ok(SpeakState::Reset) => {
                         playing = false;
-                        pending_conversions = 0;
                         tick_sink.stop();
                     }
+                    Ok(SpeakState::Converting | SpeakState::ConvertingFinished) => {}
                     Err(flume::RecvTimeoutError::Disconnected) => break,
                     Err(flume::RecvTimeoutError::Timeout) => {}
                 }
@@ -559,7 +554,9 @@ impl SpeakStream {
                     continue;
                 }
 
-                if !playing && pending_conversions > 0 && tick_sink.empty() {
+                let has_pending =
+                    thread_pending_conversions_tick.load(Ordering::SeqCst) > 0;
+                if !playing && has_pending && tick_sink.empty() {
                     if let Ok(file) = std::fs::File::open(&tick_path) {
                         tick_sink.stop();
                         tick_sink.append(rodio::Decoder::new(BufReader::new(file)).unwrap());
