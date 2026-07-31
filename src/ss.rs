@@ -1,10 +1,12 @@
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use async_openai::{
+    config::OpenAIConfig,
     types::{CreateSpeechRequestArgs, SpeechModel, Voice},
     Client,
 };
 use async_std::future;
 use colored::Colorize;
+use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::audio_ducking::AudioDucker;
 use default_device_sink::DefaultDeviceSink;
@@ -199,41 +201,46 @@ fn adjust_audio_file_speed(input: &Path, output: &Path, speed: f32) {
     };
 }
 
-/// Turns text into speech using the AI voice.
-async fn turn_text_to_speech(
+/// Maximum number of TTS attempts ("lanes") launched for a single sentence
+/// before giving up. This budget is shared across the initial attempt, the
+/// hedge lane, and any retries of failed lanes.
+const TTS_MAX_ATTEMPTS: usize = 3;
+
+/// If the first TTS attempt has not finished within this long, a second lane
+/// is raced alongside it to cut the tail latency of a slow request. Kept short
+/// enough that a stalled request does not block speech for the full per-attempt
+/// timeout, but long enough that the common (fast) case never spends a second
+/// request.
+const TTS_HEDGE_DELAY: Duration = Duration::from_secs(4);
+
+/// Performs a single text-to-speech attempt: requests speech from the API,
+/// saves it to a temp file, and optionally adjusts playback speed.
+///
+/// Returns `Err` (instead of logging + `None`) so the caller can decide whether
+/// to retry, hedge, or give up. Per-step timeouts match the original
+/// single-shot behaviour (15s for the request, 10s to save).
+async fn tts_attempt(
+    client: Client<OpenAIConfig>,
     ai_text: String,
     speed: f32,
     voice: Voice,
-) -> Option<(NamedTempFile, String)> {
-    let client = Client::new();
-
-    // Turn AI's response into speech
-
+) -> anyhow::Result<(NamedTempFile, String)> {
     let request = CreateSpeechRequestArgs::default()
         .input(&ai_text)
         .voice(voice.clone())
         .model(SpeechModel::Tts1)
         .build()
-        .unwrap();
+        .map_err(|err| anyhow!("Failed to build speech request: {err:?}"))?;
 
-    let response_result =
-        match future::timeout(Duration::from_secs(15), client.audio().speech(request)).await {
-            Ok(res) => res,
-            Err(err) => {
-                println_error(&format!(
-                    "Failed to turn text to speech due to timeout: {:?}",
-                    err
-                ));
-                return None;
-            }
-        };
-
-    let response = match response_result {
-        Ok(res) => res,
-        Err(err) => {
-            println_error(&format!("Failed to turn text to speech: {:?}", err));
-            return None;
-        }
+    let response = match future::timeout(
+        Duration::from_secs(15),
+        client.audio().speech(request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => return Err(anyhow!("speech request failed: {err:?}")),
+        Err(_) => return Err(anyhow!("speech request timed out after 15s")),
     };
 
     let ai_speech_segment_tempfile = Builder::new()
@@ -241,7 +248,7 @@ async fn turn_text_to_speech(
         .suffix(".mp3")
         .rand_bytes(16)
         .tempfile()
-        .unwrap();
+        .map_err(|err| anyhow!("Failed to create temp file: {err:?}"))?;
 
     match future::timeout(
         Duration::from_secs(10),
@@ -250,17 +257,8 @@ async fn turn_text_to_speech(
     .await
     {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            println_error(&format!("Failed to save ai speech to file: {:?}", err));
-            return None;
-        }
-        Err(err) => {
-            println_error(&format!(
-                "Failed to save ai speech to file due to timeout: {:?}",
-                err
-            ));
-            return None;
-        }
+        Ok(Err(err)) => return Err(anyhow!("Failed to save ai speech to file: {err:?}")),
+        Err(_) => return Err(anyhow!("Saving ai speech to file timed out after 10s")),
     }
 
     if speed != 1.0 {
@@ -269,7 +267,7 @@ async fn turn_text_to_speech(
             .suffix(".mp3")
             .rand_bytes(16)
             .tempfile()
-            .unwrap();
+            .map_err(|err| anyhow!("Failed to create temp file: {err:?}"))?;
 
         adjust_audio_file_speed(
             ai_speech_segment_tempfile.path(),
@@ -277,9 +275,111 @@ async fn turn_text_to_speech(
             speed,
         );
 
-        Some((sped_up_audio_path, ai_text))
+        Ok((sped_up_audio_path, ai_text))
     } else {
-        Some((ai_speech_segment_tempfile, ai_text))
+        Ok((ai_speech_segment_tempfile, ai_text))
+    }
+}
+
+/// Runs `make_attempt` with hedged racing and retries, returning the first
+/// successful result.
+///
+/// Behaviour:
+/// * One attempt starts immediately — the common, fast case costs exactly one
+///   request and adds no latency.
+/// * If no attempt has finished within `hedge_delay`, a second attempt is raced
+///   alongside the first to cut the tail latency of a slow/stalled request.
+/// * Whenever an in-flight attempt fails, a fresh attempt is started, as long as
+///   the total number of attempts started stays below `max_attempts`.
+/// * The first success wins; every other in-flight attempt is dropped
+///   (cancelled) as soon as this future returns.
+///
+/// Crucially, every attempt runs as a plain future inside the caller's task —
+/// no detached threads or `tokio::spawn`s are used. That means cancelling the
+/// caller (e.g. via `JoinHandle::abort`) cancels every attempt too, so this is
+/// safe to embed inside a cancellable pipeline without leaking work or
+/// desyncing surrounding state.
+async fn race_with_retry<F, Fut, T, E>(
+    make_attempt: F,
+    max_attempts: usize,
+    hedge_delay: Duration,
+) -> Result<T, E>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let max_attempts = max_attempts.max(1);
+
+    let mut lanes = FuturesUnordered::new();
+    let mut launched = 0usize;
+    let mut last_err: Option<E> = None;
+
+    let hedge = tokio::time::sleep(hedge_delay);
+    tokio::pin!(hedge);
+    let mut hedge_armed = true;
+
+    loop {
+        // Guarantee at least one attempt is in flight (or give up). This also
+        // keeps the `select!` below from ever observing an empty stream.
+        if lanes.is_empty() {
+            if launched < max_attempts {
+                lanes.push(make_attempt());
+                launched += 1;
+            } else {
+                return Err(last_err.expect("at least one attempt must have failed"));
+            }
+        }
+
+        tokio::select! {
+            biased;
+
+            _ = &mut hedge, if hedge_armed => {
+                hedge_armed = false;
+                if launched < max_attempts {
+                    lanes.push(make_attempt());
+                    launched += 1;
+                }
+            }
+
+            result = lanes.next() => {
+                match result {
+                    Some(Ok(value)) => return Ok(value),
+                    Some(Err(err)) => last_err = Some(err),
+                    // Unreachable: the guard above guarantees a non-empty stream.
+                    None => {}
+                }
+            }
+        }
+    }
+}
+
+/// Turns text into speech using the AI voice.
+///
+/// Wraps [`tts_attempt`] in hedged racing + retries (see [`race_with_retry`]) so
+/// a single slow or failed request no longer drops the whole sentence. On
+/// success returns the audio temp file and the originating text; on exhausting
+/// the attempt budget it logs and returns `None`, preserving the previous
+/// "failed" behaviour for callers.
+async fn turn_text_to_speech(
+    ai_text: String,
+    speed: f32,
+    voice: Voice,
+) -> Option<(NamedTempFile, String)> {
+    // A single client is shared across lanes so they reuse the same connection
+    // pool. Cloning an async-openai client is cheap.
+    let client = Client::new();
+
+    let make_attempt = || tts_attempt(client.clone(), ai_text.clone(), speed, voice.clone());
+
+    match race_with_retry(make_attempt, TTS_MAX_ATTEMPTS, TTS_HEDGE_DELAY).await {
+        Ok(success) => Some(success),
+        Err(err) => {
+            println_error(&format!(
+                "Failed to turn text to speech after up to {} attempts: {:?}",
+                TTS_MAX_ATTEMPTS, err
+            ));
+            None
+        }
     }
 }
 
@@ -756,5 +856,121 @@ mod tests {
         let speak = SpeakStream::new(Voice::Echo, 1.0, false, None);
         speak.start_audio_ducking();
         speak.stop_audio_ducking();
+    }
+
+    mod race_with_retry_tests {
+        use super::super::race_with_retry;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        /// The happy path: the first attempt succeeds, so exactly one attempt is
+        /// made and no hedge/retry is spent.
+        #[tokio::test(start_paused = true)]
+        async fn first_attempt_succeeds_uses_one_attempt() {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let counter = attempts.clone();
+            let make = move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok::<u32, String>(42)
+                }
+            };
+
+            let res = race_with_retry(make, 3, Duration::from_secs(4)).await;
+
+            assert_eq!(res, Ok(42));
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        }
+
+        /// Failed lanes are retried until one succeeds, within the budget.
+        #[tokio::test(start_paused = true)]
+        async fn retries_until_success() {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let counter = attempts.clone();
+            let make = move || {
+                let counter = counter.clone();
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        Err::<u32, String>(format!("fail {n}"))
+                    } else {
+                        Ok(7)
+                    }
+                }
+            };
+
+            let res = race_with_retry(make, 5, Duration::from_secs(4)).await;
+
+            assert_eq!(res, Ok(7));
+            assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        }
+
+        /// When every attempt fails we give up after exactly `max_attempts` and
+        /// surface the last error.
+        #[tokio::test(start_paused = true)]
+        async fn gives_up_after_max_attempts() {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let counter = attempts.clone();
+            let make = move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Err::<u32, String>("always fails".to_string())
+                }
+            };
+
+            let res = race_with_retry(make, 3, Duration::from_secs(4)).await;
+
+            assert!(res.is_err());
+            assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        }
+
+        /// A slow first attempt triggers a hedge lane after the delay; the fast
+        /// hedge wins without waiting for the stalled request.
+        #[tokio::test(start_paused = true)]
+        async fn hedges_a_slow_attempt() {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let counter = attempts.clone();
+            let make = move || {
+                let counter = counter.clone();
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        // First lane stalls far past the hedge delay.
+                        tokio::time::sleep(Duration::from_secs(100)).await;
+                        Ok::<u32, String>(1)
+                    } else {
+                        // Hedge lane answers immediately.
+                        Ok(2)
+                    }
+                }
+            };
+
+            let res = race_with_retry(make, 3, Duration::from_secs(4)).await;
+
+            assert_eq!(res, Ok(2));
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        }
+
+        /// `max_attempts` of 0 is clamped to at least one attempt.
+        #[tokio::test(start_paused = true)]
+        async fn zero_max_attempts_is_clamped() {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let counter = attempts.clone();
+            let make = move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok::<u32, String>(5)
+                }
+            };
+
+            let res = race_with_retry(make, 0, Duration::from_secs(4)).await;
+
+            assert_eq!(res, Ok(5));
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        }
     }
 }
