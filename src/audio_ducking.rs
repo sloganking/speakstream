@@ -153,11 +153,6 @@ impl ComScope {
             }
         }
     }
-
-    /// COM is usable on this thread regardless of which apartment won.
-    fn usable(hr_ok: bool) -> bool {
-        hr_ok
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -176,7 +171,6 @@ fn com_thread_init_mta() {
         // Our own worker thread: MTA is correct (no message pump). If some other
         // component already made it STA we simply carry on.
         debug_assert!(hr == S_OK || hr == S_FALSE || hr == RPC_E_CHANGED_MODE);
-        let _ = ComScope::usable(true);
     }
 }
 
@@ -184,8 +178,11 @@ fn com_thread_init_mta() {
 // Time / process helpers
 // ---------------------------------------------------------------------------
 
-/// Machine-wide escape hatch. Setting `SPEAKSTREAM_DUCK_DISABLE=1` stops every
-/// SpeakStream process from touching other applications' volumes at all.
+/// Machine-wide escape hatch. `SPEAKSTREAM_DUCK_DISABLE=1` stops this process
+/// lowering any volume, and stops the one-time repair sweep raising any.
+///
+/// Restoring still runs: a volume we already lowered must never be stranded just
+/// because the switch was flipped afterwards.
 #[cfg(target_os = "windows")]
 fn ducking_globally_disabled() -> bool {
     static DISABLED: LazyLock<bool> = LazyLock::new(|| {
@@ -548,8 +545,13 @@ unsafe fn pwstr_to_string(p: windows::core::PWSTR) -> Option<String> {
     s
 }
 
-/// Enumerates every session on every *active render endpoint*, skipping this
-/// process's own sessions.
+/// Enumerates every session on every *active render endpoint*, including this
+/// process's own.
+///
+/// Own sessions are deliberately NOT filtered here. Deciding what must not be
+/// ducked needs the shared ducker registry, which only `run_pass` has, and every
+/// guardian has to reach that decision the same way — a guardian that quietly
+/// exempted itself would fight the others over the same session.
 ///
 /// Enumerating all endpoints rather than only the default one is what makes
 /// ducking survive the user switching output devices mid-speech: a session's
@@ -807,6 +809,10 @@ impl Guardian {
             state.migration_deadline_ms = Some(now + MIGRATION_WINDOW.as_millis() as u64);
         }
         let migration_active = !migration_disabled()
+            // The kill switch must stop us WRITING volumes at all, and the repair
+            // sweep writes 1.0. Emptying `local` alone does not cover it: that
+            // makes should_duck false, which is exactly what this branch needs.
+            && !ducking_globally_disabled()
             && have_lock
             && state
                 .migration_deadline_ms
@@ -1153,29 +1159,41 @@ impl AudioDucker {
         }
     }
 
-    /// Emergency repair: sets every session on every active render endpoint to
-    /// full volume and forgets all outstanding baselines.
+    /// Emergency repair: forces every *reachable* session to full volume.
     ///
     /// Intended for a user-facing "fix my audio" action. Ordinary operation
     /// never needs it — the guardian restores the *original* volumes rather
     /// than blindly forcing everything to 100%.
+    ///
+    /// Only the baselines of sessions it actually reached are dropped. An
+    /// application that is not playing right now cannot be reached at all, and
+    /// discarding its record would strand it at the ducked volume forever —
+    /// keeping the record is what lets the guardian repair it the next time it
+    /// plays. Returns the number of sessions changed.
     pub fn restore_all_to_full() -> usize {
         #[cfg(target_os = "windows")]
         {
             let _com = ComScope::new();
-            // Hold the lock across the whole operation so a guardian pass cannot
-            // interleave and re-record what we are in the middle of clearing.
-            let _lock = CrossProcessLock::acquire(LOCK_WAIT);
+            // Serialise against guardian passes so one cannot re-record a
+            // baseline while we are clearing it. Without the lock we still fix
+            // the volumes — that is always safe — but leave the records alone.
+            let lock = CrossProcessLock::acquire(LOCK_WAIT);
             let mut n = 0;
+            let mut reached: HashSet<String> = HashSet::new();
             for s in collect_sessions() {
+                reached.insert(s.identifier.clone());
                 if s.volume < 1.0 - EPS && set_volume(&s, 1.0) {
                     n += 1;
                 }
             }
-            let (mut state, _) = SharedState::read();
-            state.baselines.clear();
-            state.migrated.clear();
-            let _ = state.write();
+            if lock.is_some() {
+                let (mut state, readable) = SharedState::read();
+                if readable {
+                    state.baselines.retain(|id, _| !reached.contains(id));
+                    state.migrated.clear();
+                    let _ = state.write();
+                }
+            }
             n
         }
         #[cfg(not(target_os = "windows"))]

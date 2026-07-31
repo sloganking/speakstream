@@ -2,7 +2,7 @@
 //!
 //! Every mode here is COMPLETELY SILENT: victims open real WASAPI render
 //! streams (so they show up in the volume mixer exactly like a real app) but
-//! only ever push zero-valued samples.
+//! never queue any audio — opening the stream is what registers the session.
 //!
 //! Subcommands:
 //!   dump                                  print every render session as JSON
@@ -15,7 +15,9 @@
 //!   heal <secs>                           just run a guardian for <secs>
 //!                                         (models a tray app starting up)
 //!   state                                 print the persistent duck state file
-//!   set-all <volume>                      force every session to <volume>
+//!   set-all <volume> [id-substring]       force sessions to <volume>; without
+//!                                         a filter this hits EVERY app on the
+//!                                         machine, so always pass a filter
 
 use std::env;
 use std::time::Duration;
@@ -122,7 +124,13 @@ mod probe {
         out
     }
 
-    pub fn set_all(volume: f32) -> usize {
+    /// Sets sessions to `volume`. When `only` is given, only sessions whose
+    /// identifier contains that substring are touched.
+    ///
+    /// Always pass a filter from a test script. An unfiltered reset destroys the
+    /// real per-application volumes of whoever is at the machine — music player,
+    /// chat, browser — and those settings are not recoverable.
+    pub fn set_all(volume: f32, only: Option<&str>) -> usize {
         let mut n = 0;
         unsafe {
             let enumerator: IMMDeviceEnumerator =
@@ -149,6 +157,17 @@ mod probe {
                 };
                 for i in 0..sessions.GetCount().unwrap_or(0) {
                     if let Ok(control) = sessions.GetSession(i) {
+                        if let Some(needle) = only {
+                            let matches = control
+                                .cast::<IAudioSessionControl2>()
+                                .ok()
+                                .and_then(|c2| c2.GetSessionIdentifier().ok())
+                                .map(|p| pwstr_to_string(p).contains(needle))
+                                .unwrap_or(false);
+                            if !matches {
+                                continue;
+                            }
+                        }
                         if let Ok(v) = control.cast::<ISimpleAudioVolume>() {
                             if v.SetMasterVolume(volume, std::ptr::null()).is_ok() {
                                 n += 1;
@@ -226,8 +245,17 @@ fn main() {
             "set-all" => {
                 probe::com_init();
                 let v: f32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1.0);
-                let n = probe::set_all(v);
-                println!("set {} sessions to {}", n, v);
+                let only = args.get(2).map(|s| s.as_str());
+                let n = probe::set_all(v, only);
+                println!(
+                    "set {} sessions to {}{}",
+                    n,
+                    v,
+                    match only {
+                        Some(f) => format!(" (only ids containing {:?})", f),
+                        None => String::new(),
+                    }
+                );
             }
             "victim" => {
                 let mode = args.get(1).map(|s| s.as_str()).unwrap_or("hold");
@@ -298,10 +326,16 @@ fn main() {
                 std::thread::sleep(Duration::from_secs(secs));
             }
             "state" => {
-                let base = std::env::var_os("LOCALAPPDATA")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(std::env::temp_dir);
-                let p = base.join("speakstream").join("duck-state-v2.txt");
+                // Must honour SPEAKSTREAM_STATE_DIR the same way the library does,
+                // or this reports on a file nobody is using.
+                let p = match std::env::var_os("SPEAKSTREAM_STATE_DIR") {
+                    Some(dir) => std::path::PathBuf::from(dir).join("duck-state-v2.txt"),
+                    None => std::env::var_os("LOCALAPPDATA")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(std::env::temp_dir)
+                        .join("speakstream")
+                        .join("duck-state-v2.txt"),
+                };
                 match std::fs::read_to_string(&p) {
                     Ok(c) => println!("{}\n--- {} ---", c.trim_end(), p.display()),
                     Err(e) => println!("(no state file at {}: {})", p.display(), e),

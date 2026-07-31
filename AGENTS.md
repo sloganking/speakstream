@@ -1,3 +1,13 @@
+## Before touching audio ducking
+
+Read `docs/audio-ducking.md` first. The Windows audio-ducking bug in
+`src/audio_ducking.rs` defeated several previous attempts because the failure
+mode cannot be seen from the source — it depends on how Windows remembers
+per-application volume after a stream ends. That document lists the invariants a
+change must not break and how to actually falsify a fix
+(`scripts/verify-ducking.ps1`). A fix that has not been run against that harness
+should not be believed.
+
 ## Use gitmoji for every git commit.
 
 ## AI testing responsibilities
