@@ -246,7 +246,12 @@ fn main() {
                 let ratio: f32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.5);
                 let hold: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3);
                 let ducker = AudioDucker::new(Some(ratio));
-                println!("ducking at ratio {} for {}s (pid {})", ratio, hold, std::process::id());
+                println!(
+                    "ducking at ratio {} for {}s (pid {})",
+                    ratio,
+                    hold,
+                    std::process::id()
+                );
                 ducker.duck();
                 std::thread::sleep(Duration::from_secs(hold));
                 if cmd == "duck-crash" {
@@ -272,7 +277,12 @@ fn main() {
                 let linger: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
                 let _sink = DefaultDeviceSink::new();
                 let ducker = AudioDucker::new(Some(ratio));
-                println!("speaking at ratio {} for {}s (pid {})", ratio, secs, std::process::id());
+                println!(
+                    "speaking at ratio {} for {}s (pid {})",
+                    ratio,
+                    secs,
+                    std::process::id()
+                );
                 ducker.duck();
                 std::thread::sleep(Duration::from_secs(secs));
                 ducker.restore();

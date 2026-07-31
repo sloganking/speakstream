@@ -220,7 +220,8 @@ fn migration_disabled() -> bool {
 fn legacy_state_present() -> bool {
     static PRESENT: LazyLock<bool> = LazyLock::new(|| {
         let tmp = std::env::temp_dir();
-        tmp.join("speakstream-duck-state.txt").exists() || tmp.join("speakstream-duck.lock").exists()
+        tmp.join("speakstream-duck-state.txt").exists()
+            || tmp.join("speakstream-duck.lock").exists()
     });
     *PRESENT
 }
@@ -1191,14 +1192,23 @@ impl AudioDucker {
         let id = self.instance_id.clone();
         // Ducking late is a cosmetic problem, so bound the wait tightly rather
         // than stalling the playback thread.
-        GUARDIAN.request_and_wait(move |g| { g.local.insert(id, ratio); }, DUCK_WAIT);
+        GUARDIAN.request_and_wait(
+            move |g| {
+                g.local.insert(id, ratio);
+            },
+            DUCK_WAIT,
+        );
     }
 
     #[cfg(target_os = "windows")]
     fn restore_impl(&self) {
         let id = self.instance_id.clone();
-        let serviced =
-            GUARDIAN.request_and_wait(move |g| { g.local.remove(&id); }, RESTORE_WAIT);
+        let serviced = GUARDIAN.request_and_wait(
+            move |g| {
+                g.local.remove(&id);
+            },
+            RESTORE_WAIT,
+        );
 
         // Restoring late is NOT cosmetic: callers exit right after this (Drop,
         // the Ctrl+C handler, the panic hook). If no pass actually observed the
@@ -1232,8 +1242,12 @@ impl Drop for AudioDucker {
             let id = self.instance_id.clone();
             let still_registered = GUARDIAN.inner.lock().unwrap().local.contains_key(&id);
             if still_registered {
-                let serviced =
-                    GUARDIAN.request_and_wait(move |g| { g.local.remove(&id); }, RESTORE_WAIT);
+                let serviced = GUARDIAN.request_and_wait(
+                    move |g| {
+                        g.local.remove(&id);
+                    },
+                    RESTORE_WAIT,
+                );
                 if !serviced {
                     let _com = ComScope::new();
                     GUARDIAN.run_pass();
